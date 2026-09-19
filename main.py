@@ -110,6 +110,43 @@ def predict_kongnet(img: Image.Image, conf_threshold: float, img_size: int) -> L
             auto_get_mask=False
         )
 
+        # TIAToolbox NucleusDetector patch mode returns parallel coordinate arrays:
+        # {"x": [da.Array], "y": [da.Array], "classes": [da.Array], "probabilities": [da.Array]}
+        if isinstance(raw_output, dict) and "x" in raw_output and "y" in raw_output:
+            xs_list = raw_output.get("x", [])
+            ys_list = raw_output.get("y", [])
+            probs_list = raw_output.get("probabilities", [])
+
+            if len(xs_list) > 0 and len(ys_list) > 0:
+                xs = xs_list[0]
+                ys = ys_list[0]
+                probs = probs_list[0] if len(probs_list) > 0 else None
+
+                if hasattr(xs, "compute"):
+                    xs = xs.compute()
+                if hasattr(ys, "compute"):
+                    ys = ys.compute()
+                if probs is not None and hasattr(probs, "compute"):
+                    probs = probs.compute()
+
+                import numpy as np
+                xs = np.asarray(xs)
+                ys = np.asarray(ys)
+                probs = np.asarray(probs) if probs is not None else np.ones_like(xs, dtype=float)
+
+                for x_val, y_val, p_val in zip(xs, ys, probs):
+                    prob = float(p_val)
+                    if prob < conf_threshold:
+                        continue
+                    boxes_out.append({
+                        "cx": round(float(x_val), 2),
+                        "cy": round(float(y_val), 2),
+                        "width": 48.0,
+                        "height": 48.0,
+                        "confidence": round(prob, 4)
+                    })
+                return boxes_out
+
         inst_dict = {}
         if isinstance(raw_output, dict):
             if tmp_path in raw_output:
