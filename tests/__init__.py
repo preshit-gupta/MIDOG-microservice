@@ -1,0 +1,1 @@
+"""MIDOG tests package."""

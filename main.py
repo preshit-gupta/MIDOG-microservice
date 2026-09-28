@@ -1,249 +1,84 @@
 import base64
 import io
 import os
-import sys
-import tempfile
 import logging
 from typing import Any, Dict, List
 from fastapi import FastAPI, Request, HTTPException
 from PIL import Image
+import numpy as np
 
-# Configure logging
+from engine import get_engine
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("midog-detector")
 
-app = FastAPI(title="MIDOG Mitosis Detector for Vertex AI")
+app = FastAPI(title="MIDOG Mitosis Detector for Vertex AI (v2 Contract)")
 
-MODEL_ENGINE = os.environ.get("MODEL_ENGINE", "auto").lower()
-MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")
 HEALTH_ROUTE = os.environ.get("AIP_HEALTH_ROUTE", "/health")
 PREDICT_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/predict")
 
-active_engine = None
-model_instance = None
-
-
-def init_engine():
-    global active_engine, model_instance
-
-    # Determine desired engine
-    target_engine = MODEL_ENGINE
-    if target_engine == "auto":
-        # If a non-placeholder best.pt exists (>10MB), default to YOLO; otherwise use KongNet winner
-        if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 10 * 1024 * 1024:
-            target_engine = "yolo"
-        else:
-            target_engine = "kongnet"
-
-    logger.info(f"Initializing MIDOG Detector engine: '{target_engine}'")
-
-    if target_engine == "kongnet":
-        try:
-            logger.info("Loading KongNet_Det_MIDOG_1 (1st Place Winner MIDOG Challenge)...")
-            from tiatoolbox.models.engine.nucleus_detector import NucleusDetector
-            import torch
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model_instance = NucleusDetector(
-                model="KongNet_Det_MIDOG_1",
-                batch_size=1,
-                device=device,
-                verbose=False
-            )
-            active_engine = "kongnet"
-            logger.info(f"KongNet_Det_MIDOG_1 successfully loaded on device: {device}")
-            return
-        except Exception as e:
-            logger.error(f"Failed to load KongNet_Det_MIDOG_1 via tiatoolbox: {e}")
-            if os.path.exists(MODEL_PATH):
-                logger.info(f"Attempting fallback to YOLO with {MODEL_PATH}...")
-                target_engine = "yolo"
-            else:
-                raise e
-
-    if target_engine == "yolo":
-        try:
-            logger.info(f"Loading YOLO model from: {MODEL_PATH}")
-            from ultralytics import YOLO
-            model_instance = YOLO(MODEL_PATH)
-            active_engine = "yolo"
-            logger.info("YOLO model successfully loaded.")
-            return
-        except Exception as e:
-            logger.error(f"Failed to load YOLO model: {e}")
-            raise e
-
-
+# Pre-initialize engine on startup if dependencies exist
 try:
-    init_engine()
+    _ = get_engine()
 except Exception as err:
-    logger.error(f"Engine initialization error: {err}")
-    active_engine = None
-    model_instance = None
+    logger.warning(f"Engine pre-initialization notice (safe in test/mock environments): {err}")
 
 
 @app.get(HEALTH_ROUTE)
 @app.get("/health")
 def health() -> Dict[str, Any]:
     """Vertex AI liveness and readiness probe."""
-    if model_instance is None or active_engine is None:
+    try:
+        engine = get_engine()
+    except Exception:
+        engine = None
+
+    if engine is None:
         raise HTTPException(status_code=503, detail="Model engine not loaded")
+
     return {
         "status": "healthy",
-        "engine": active_engine,
-        "model": "KongNet_Det_MIDOG_1" if active_engine == "kongnet" else MODEL_PATH
+        "model": "KongNet_Det_MIDOG_1",
+        "weights_sha256": getattr(engine, "weights_sha256", "unknown"),
     }
 
 
-def predict_kongnet(img: Image.Image, conf_threshold: float, img_size: int) -> List[Dict[str, Any]]:
-    """Runs inference using TIAToolbox KongNet_Det_MIDOG_1."""
-    boxes_out = []
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
-        tmp_path = tmp_file.name
-        img.save(tmp_path, format="PNG")
-
+@app.get("/metadata")
+def metadata() -> Dict[str, Any]:
+    """v2 contract metadata endpoint (SPEC-06 §4)."""
     try:
-        raw_output = model_instance.run(
-            images=[tmp_path],
-            output_type="dict",
-            patch_mode=True,
-            auto_get_mask=False
-        )
+        engine = get_engine()
+    except Exception:
+        engine = None
 
-        # TIAToolbox NucleusDetector patch mode returns parallel coordinate arrays:
-        # {"x": [da.Array], "y": [da.Array], "classes": [da.Array], "probabilities": [da.Array]}
-        if isinstance(raw_output, dict) and "x" in raw_output and "y" in raw_output:
-            xs_list = raw_output.get("x", [])
-            ys_list = raw_output.get("y", [])
-            probs_list = raw_output.get("probabilities", [])
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Model engine not loaded")
 
-            if len(xs_list) > 0 and len(ys_list) > 0:
-                xs = xs_list[0]
-                ys = ys_list[0]
-                probs = probs_list[0] if len(probs_list) > 0 else None
-
-                if hasattr(xs, "compute"):
-                    xs = xs.compute()
-                if hasattr(ys, "compute"):
-                    ys = ys.compute()
-                if probs is not None and hasattr(probs, "compute"):
-                    probs = probs.compute()
-
-                import numpy as np
-                xs = np.asarray(xs)
-                ys = np.asarray(ys)
-                probs = np.asarray(probs) if probs is not None else np.ones_like(xs, dtype=float)
-
-                for x_val, y_val, p_val in zip(xs, ys, probs):
-                    prob = float(p_val)
-                    if prob < conf_threshold:
-                        continue
-                    boxes_out.append({
-                        "cx": round(float(x_val), 2),
-                        "cy": round(float(y_val), 2),
-                        "width": 48.0,
-                        "height": 48.0,
-                        "confidence": round(prob, 4)
-                    })
-                return boxes_out
-
-        inst_dict = {}
-        if isinstance(raw_output, dict):
-            if tmp_path in raw_output:
-                inst_dict = raw_output[tmp_path]
-            elif 0 in raw_output:
-                inst_dict = raw_output[0]
-            else:
-                for v in raw_output.values():
-                    if isinstance(v, dict):
-                        inst_dict = v
-                        break
-        elif isinstance(raw_output, (list, tuple)) and len(raw_output) > 0:
-            inst_dict = raw_output[0]
-
-        if isinstance(inst_dict, dict):
-            for _, inst in inst_dict.items():
-                if not isinstance(inst, dict):
-                    continue
-                prob = float(inst.get("prob", inst.get("confidence", 1.0)))
-                if prob < conf_threshold:
-                    continue
-
-                centroid = inst.get("centroid")
-                box = inst.get("box")
-
-                if centroid is not None and len(centroid) >= 2:
-                    cx = float(centroid[0])
-                    cy = float(centroid[1])
-                elif box is not None and len(box) >= 4:
-                    cx = float(box[0] + box[2]) / 2.0
-                    cy = float(box[1] + box[3]) / 2.0
-                else:
-                    continue
-
-                if box is not None and len(box) >= 4:
-                    w = float(box[2] - box[0])
-                    h = float(box[3] - box[1])
-                else:
-                    w, h = 48.0, 48.0
-
-                boxes_out.append({
-                    "cx": round(cx, 2),
-                    "cy": round(cy, 2),
-                    "width": round(w, 2),
-                    "height": round(h, 2),
-                    "confidence": round(prob, 4)
-                })
-
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-    return boxes_out
-
-
-def predict_yolo(img: Image.Image, conf_threshold: float, img_size: int) -> List[Dict[str, Any]]:
-    """Runs inference using Ultralytics YOLO."""
-    results = model_instance.predict(
-        source=img,
-        imgsz=img_size,
-        conf=conf_threshold,
-        verbose=False
-    )
-    boxes_out = []
-    for r in results:
-        for box in r.boxes:
-            xywh = box.xywh[0].tolist()
-            conf = float(box.conf[0])
-            boxes_out.append({
-                "cx": round(xywh[0], 2),
-                "cy": round(xywh[1], 2),
-                "width": round(xywh[2], 2),
-                "height": round(xywh[3], 2),
-                "confidence": round(conf, 4)
-            })
-    return boxes_out
+    return {
+        "model": "KongNet_Det_MIDOG_1",
+        "tiatoolbox": getattr(engine, "tiatoolbox_version", "2.1.3"),
+        "weights_sha256": getattr(engine, "weights_sha256", "unknown"),
+        "input_mpp": getattr(engine, "input_mpp", 0.25),
+        "patch_px": getattr(engine, "patch_px", 512),
+        "output": "points",
+        "deterministic": True,
+        "contract": "v2",
+    }
 
 
 @app.post(PREDICT_ROUTE)
 @app.post("/predict")
-async def predict(request: Request) -> Dict[str, List[Dict[str, Any]]]:
+async def predict(request: Request) -> Dict[str, Any]:
     """
-    Accepts Vertex AI prediction payloads:
-    {
-      "instances": [
-        {"image_bytes": "<base64_encoded_jpeg_or_png>"}
-      ],
-      "parameters": {
-        "conf": 0.25,
-        "imgsz": 512
-      }
-    }
+    Accepts Vertex AI prediction payloads.
+    Differentiates between v2 (lossless PNG, resolution-checked) and legacy formats per instance.
     """
-    if model_instance is None or active_engine is None:
+    try:
+        engine = get_engine()
+    except Exception:
+        engine = None
+
+    if engine is None:
         raise HTTPException(status_code=503, detail="Model engine not initialized")
 
     try:
@@ -254,38 +89,130 @@ async def predict(request: Request) -> Dict[str, List[Dict[str, Any]]]:
 
     instances = body.get("instances", [])
     parameters = body.get("parameters", {})
-    conf_threshold = float(parameters.get("conf", 0.25))
-    img_size = int(parameters.get("imgsz", 512))
+    default_min_prob = float(parameters.get("min_prob", 0.01))
+    default_conf = float(parameters.get("conf", 0.25))
+
+    weights_sha = getattr(engine, "weights_sha256", "unknown")
 
     if not instances:
-        return {"predictions": []}
+        return {"predictions": [], "model_sha256": weights_sha}
 
-    predictions = []
+    predictions: List[Dict[str, Any]] = []
 
     for idx, item in enumerate(instances):
-        b64_str = item.get("image_bytes")
-        if not b64_str:
-            predictions.append({"boxes": []})
-            continue
+        # 1. v2 Contract Format: image_png_b64 + mpp
+        if "image_png_b64" in item:
+            b64_str = item.get("image_png_b64")
+            if not b64_str:
+                predictions.append({"points": [], "error": "empty_image_data"})
+                continue
 
-        try:
-            img_bytes = base64.b64decode(b64_str)
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            try:
+                raw_bytes = base64.b64decode(b64_str)
+            except Exception as e:
+                predictions.append({"points": [], "error": f"invalid_base64: {e}"})
+                continue
 
-            item_conf = float(item.get("confidence_threshold", conf_threshold))
+            # Check lossless PNG format (magic bytes: \x89PNG\r\n\x1a\n)
+            if len(raw_bytes) < 8 or raw_bytes[:8] != b"\x89PNG\r\n\x1a\n":
+                predictions.append({"points": [], "error": "invalid_format: input image must be PNG"})
+                continue
 
-            if active_engine == "kongnet":
-                boxes = predict_kongnet(img, item_conf, img_size)
-            else:
-                boxes = predict_yolo(img, item_conf, img_size)
+            # Check MPP resolution
+            mpp = item.get("mpp")
+            if mpp is None:
+                predictions.append({"points": [], "error": "missing_mpp: 'mpp' field is required in v2 contract"})
+                continue
 
-            predictions.append({"boxes": boxes})
+            try:
+                mpp_val = float(mpp)
+            except (ValueError, TypeError):
+                predictions.append({"points": [], "error": f"invalid_mpp: expected float, got {mpp}"})
+                continue
 
-        except Exception as err:
-            logger.error(f"Error processing instance #{idx}: {err}")
-            predictions.append({"boxes": [], "error": str(err)})
+            expected_mpp = float(getattr(engine, "input_mpp", 0.25))
+            if abs(mpp_val - expected_mpp) / expected_mpp > 0.01:
+                predictions.append({
+                    "points": [],
+                    "error": f"mpp_mismatch: expected {expected_mpp}, got {mpp_val}",
+                })
+                continue
 
-    return {"predictions": predictions}
+            # Check image size
+            expected_px = int(getattr(engine, "patch_px", 512))
+            try:
+                img = Image.open(io.BytesIO(raw_bytes))
+                if img.width != expected_px or img.height != expected_px:
+                    predictions.append({
+                        "points": [],
+                        "error": f"invalid_size: expected {expected_px}x{expected_px}, got {img.width}x{img.height}",
+                    })
+                    continue
+                img_rgb = np.array(img.convert("RGB"))
+            except Exception as e:
+                predictions.append({"points": [], "error": f"image_decode_error: {e}"})
+                continue
+
+            # Predict and filter by min_prob
+            item_min_prob = float(item.get("min_prob", default_min_prob))
+            try:
+                raw_points = engine.predict(img_rgb)
+                filtered_points = [
+                    {
+                        "x": round(float(x), 2),
+                        "y": round(float(y), 2),
+                        "prob": round(float(p), 4),
+                    }
+                    for x, y, p in raw_points
+                    if float(p) >= item_min_prob
+                ]
+                predictions.append({"points": filtered_points, "error": None})
+            except Exception as e:
+                logger.error(f"Inference error on v2 instance #{idx}: {e}")
+                predictions.append({"points": [], "error": f"inference_error: {e}"})
+
+        # 2. Legacy v5 Format: image_bytes
+        elif "image_bytes" in item:
+            logger.info("legacy_contract_used")
+            b64_str = item.get("image_bytes")
+            if not b64_str:
+                predictions.append({"boxes": []})
+                continue
+
+            try:
+                img_bytes = base64.b64decode(b64_str)
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                img_rgb = np.array(img)
+
+                item_conf = float(item.get("confidence_threshold", default_conf))
+                raw_points = engine.predict(img_rgb)
+
+                boxes = [
+                    {
+                        "cx": round(float(x), 2),
+                        "cy": round(float(y), 2),
+                        "width": 48.0,
+                        "height": 48.0,
+                        "confidence": round(float(p), 4),
+                    }
+                    for x, y, p in raw_points
+                    if float(p) >= item_conf
+                ]
+                predictions.append({"boxes": boxes})
+            except Exception as err:
+                logger.error(f"Error processing legacy instance #{idx}: {err}")
+                predictions.append({"boxes": [], "error": str(err)})
+
+        else:
+            predictions.append({
+                "points": [],
+                "error": "invalid_instance: expected 'image_png_b64' (v2) or 'image_bytes' (legacy)",
+            })
+
+    return {
+        "predictions": predictions,
+        "model_sha256": weights_sha,
+    }
 
 
 if __name__ == "__main__":

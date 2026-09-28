@@ -21,10 +21,9 @@ param(
     [string]$ProjectId = "oncogemma",
     [string]$Region = "us-central1",
     [string]$RepoName = "oncogemma-repo",
-    [string]$ImageTag = "midog-detector:v1",
+    [string]$ImageTag = "midog-detector:v2",
     [string]$EndpointName = "mitosis-detector-endpoint",
-    [string]$ModelDisplayName = "midog-kongnet-v1",
-    [string]$Engine = "kongnet",
+    [string]$ModelDisplayName = "midog-kongnet-v2",
     [switch]$DeployGPU,
     [switch]$DeployCPU
 )
@@ -36,27 +35,19 @@ if ($DeployCPU -and -not $DeployGPU) {
 }
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "  MIDOG Mitosis Detector Vertex AI Deployment Pipeline" -ForegroundColor Cyan
+Write-Host "  MIDOG Mitosis Detector Vertex AI Deployment Pipeline (v2)" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "GCP Project : $ProjectId"
 Write-Host "Region      : $Region"
 Write-Host "Repository  : $RepoName"
 Write-Host "Image Tag   : $ImageTag"
-Write-Host "Model Engine: $(if ($Engine -eq 'kongnet') {'KongNet_Det_MIDOG_1 (1st Place Challenge Winner)'} else {'YOLO (' + $Engine + ')'})"
+Write-Host "Model Engine: KongNet_Det_MIDOG_1 (1st Place Challenge Winner)"
 Write-Host "Hardware    : $(if ($useGpu) {'NVIDIA T4 GPU (n1-standard-4)'} else {'CPU Only (e2-standard-4)'})"
 Write-Host "=========================================================="
 
-# 1. Verify model engine & weights
-if ($Engine -eq "yolo") {
-    if (-not (Test-Path "best.pt")) {
-        Write-Host "[ERROR] 'best.pt' not found in current directory for YOLO engine!" -ForegroundColor Red
-        Write-Host "Please place your MIDOG model checkpoint as 'best.pt' or deploy with -Engine kongnet" -ForegroundColor Yellow
-        exit 1
-    }
-} else {
-    Write-Host "[INFO] Deploying KongNet_Det_MIDOG_1 (Official MIDOG Challenge Winner)." -ForegroundColor Green
-    Write-Host "[INFO] Model weights will be pre-cached into container during Cloud Build." -ForegroundColor Gray
-}
+# 1. Verify model engine
+Write-Host "[INFO] Deploying KongNet_Det_MIDOG_1 (Official MIDOG Challenge Winner, v2 contract)." -ForegroundColor Green
+Write-Host "[INFO] Model weights will be pre-cached into container during Cloud Build." -ForegroundColor Gray
 
 # 2. Configure GCP Project
 Write-Host "`n[Step 1/6] Configuring gcloud project..." -ForegroundColor Green

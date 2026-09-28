@@ -2,13 +2,16 @@
 Test script to send sample prediction requests to local container or deployed Vertex AI Endpoint.
 
 Usage:
-    # 1. Test local container (http://localhost:8080)
+    # 1. Test local container (http://localhost:8080) with v2 contract
     python test_predict.py --local
 
-    # 2. Test local container with a custom image
-    python test_predict.py --local --image path/to/sample_tile.jpg
+    # 2. Test local container with legacy v5 contract
+    python test_predict.py --local --legacy
 
-    # 3. Test deployed Vertex AI Endpoint
+    # 3. Test local container with custom PNG tile
+    python test_predict.py --local --image path/to/sample_tile.png
+
+    # 4. Test deployed Vertex AI Endpoint
     python test_predict.py --endpoint-id 1234567890123456789 --project-id oncogemma --region us-central1
 """
 
@@ -24,9 +27,9 @@ import subprocess
 from PIL import Image, ImageDraw
 
 
-def create_synthetic_tile() -> bytes:
-    """Generate a synthetic 512x512 tile for quick smoke testing."""
-    img = Image.new("RGB", (512, 512), color=(235, 215, 230)) # H&E background tone
+def create_synthetic_png_tile() -> bytes:
+    """Generate a synthetic 512x512 lossless PNG tile for smoke testing."""
+    img = Image.new("RGB", (512, 512), color=(235, 215, 230))  # H&E background tone
     draw = ImageDraw.Draw(img)
 
     # Draw simulated nuclei and dense chromatin clumps (mitosis candidates)
@@ -35,19 +38,26 @@ def create_synthetic_tile() -> bytes:
     draw.ellipse([380, 400, 410, 430], fill=(50, 15, 80))
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG")
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def load_image_bytes(image_path: str = None) -> bytes:
+def load_png_bytes(image_path: str = None) -> bytes:
     if image_path and os.path.exists(image_path):
         with open(image_path, "rb") as f:
-            return f.read()
-    print("[INFO] No input image provided. Generating synthetic 512x512 H&E tile...")
-    return create_synthetic_tile()
+            data = f.read()
+            if data[:8] == b"\x89PNG\r\n\x1a\n":
+                return data
+            # Convert to PNG if not already PNG
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+    print("[INFO] No input image provided. Generating synthetic 512x512 PNG tile...")
+    return create_synthetic_png_tile()
 
 
-def test_local(image_bytes: bytes, host: str = "http://localhost:8080"):
+def test_local(image_bytes: bytes, host: str = "http://localhost:8080", legacy: bool = False, mpp: float = 0.25):
     print(f"\n[INFO] Testing local server at: {host}")
     b64_str = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -61,18 +71,39 @@ def test_local(image_bytes: bytes, host: str = "http://localhost:8080"):
         print(f"[HEALTH CHECK ERROR] Could not reach {host}/health: {e}")
         return
 
-    # 2. Prediction check
-    payload = {
-        "instances": [
-            {"image_bytes": b64_str}
-        ],
-        "parameters": {
-            "conf": 0.25,
-            "imgsz": 512
-        }
-    }
-    payload_json = json.dumps(payload).encode("utf-8")
+    # 2. Metadata check
+    try:
+        meta_req = urllib.request.Request(f"{host}/metadata")
+        with urllib.request.urlopen(meta_req, timeout=5) as resp:
+            meta_data = json.loads(resp.read().decode("utf-8"))
+            print(f"[METADATA CHECK] Status: {resp.status} Response: {meta_data}")
+    except Exception as e:
+        print(f"[METADATA CHECK ERROR] Could not reach {host}/metadata: {e}")
 
+    # 3. Prediction check
+    if legacy:
+        print("[INFO] Sending legacy v5 prediction request...")
+        payload = {
+            "instances": [
+                {"image_bytes": b64_str, "confidence_threshold": 0.25}
+            ],
+            "parameters": {
+                "conf": 0.25,
+                "imgsz": 512
+            }
+        }
+    else:
+        print(f"[INFO] Sending v2 contract prediction request (mpp={mpp})...")
+        payload = {
+            "instances": [
+                {"image_png_b64": b64_str, "mpp": mpp}
+            ],
+            "parameters": {
+                "min_prob": 0.01
+            }
+        }
+
+    payload_json = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{host}/predict",
         data=payload_json,
@@ -86,18 +117,24 @@ def test_local(image_bytes: bytes, host: str = "http://localhost:8080"):
             res_body = json.loads(resp.read().decode("utf-8"))
             print(f"\n[SUCCESS] Response received in {elapsed_ms:.1f} ms")
             print(json.dumps(res_body, indent=2))
-            
+
             predictions = res_body.get("predictions", [])
             for i, p in enumerate(predictions):
-                boxes = p.get("boxes", [])
-                print(f"--> Instance #{i+1}: {len(boxes)} mitotic figures detected.")
-                for b_idx, b in enumerate(boxes[:5]):
-                    print(f"    Candidate #{b_idx+1}: center=({b.get('cx')}, {b.get('cy')}), conf={b.get('confidence')}")
+                if "points" in p:
+                    pts = p.get("points", [])
+                    print(f"--> Instance #{i+1} (v2): {len(pts)} candidate points detected.")
+                    for b_idx, pt in enumerate(pts[:5]):
+                        print(f"    Point #{b_idx+1}: ({pt.get('x')}, {pt.get('y')}), prob={pt.get('prob')}")
+                elif "boxes" in p:
+                    boxes = p.get("boxes", [])
+                    print(f"--> Instance #{i+1} (legacy): {len(boxes)} mitotic figures detected.")
+                    for b_idx, b in enumerate(boxes[:5]):
+                        print(f"    Candidate #{b_idx+1}: center=({b.get('cx')}, {b.get('cy')}), conf={b.get('confidence')}")
     except Exception as e:
         print(f"[PREDICTION ERROR] Failed to run prediction: {e}")
 
 
-def test_vertex_endpoint(image_bytes: bytes, endpoint_id: str, project_id: str, region: str):
+def test_vertex_endpoint(image_bytes: bytes, endpoint_id: str, project_id: str, region: str, legacy: bool = False, mpp: float = 0.25):
     print(f"\n[INFO] Testing Vertex AI Endpoint: {endpoint_id} in {region} ({project_id})")
     b64_str = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -114,17 +151,27 @@ def test_vertex_endpoint(image_bytes: bytes, endpoint_id: str, project_id: str, 
 
     endpoint_url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/endpoints/{endpoint_id}:predict"
 
-    payload = {
-        "instances": [
-            {"image_bytes": b64_str}
-        ],
-        "parameters": {
-            "conf": 0.25,
-            "imgsz": 512
+    if legacy:
+        payload = {
+            "instances": [
+                {"image_bytes": b64_str, "confidence_threshold": 0.25}
+            ],
+            "parameters": {
+                "conf": 0.25,
+                "imgsz": 512
+            }
         }
-    }
-    payload_json = json.dumps(payload).encode("utf-8")
+    else:
+        payload = {
+            "instances": [
+                {"image_png_b64": b64_str, "mpp": mpp}
+            ],
+            "parameters": {
+                "min_prob": 0.01
+            }
+        }
 
+    payload_json = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         endpoint_url,
         data=payload_json,
@@ -146,20 +193,22 @@ def test_vertex_endpoint(image_bytes: bytes, endpoint_id: str, project_id: str, 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test YOLOv8-MIDOG Inference")
+    parser = argparse.ArgumentParser(description="Test MIDOG Detector Service (v2 Contract)")
     parser.add_argument("--local", action="store_true", help="Test local container at http://localhost:8080")
     parser.add_argument("--host", type=str, default="http://localhost:8080", help="Local server URL")
-    parser.add_argument("--image", type=str, default=None, help="Path to input image/tile")
+    parser.add_argument("--image", type=str, default=None, help="Path to input image/tile (PNG)")
+    parser.add_argument("--legacy", action="store_true", help="Send legacy v5 format request")
+    parser.add_argument("--mpp", type=float, default=0.25, help="MPP value for v2 request")
     parser.add_argument("--endpoint-id", type=str, default=None, help="Vertex AI numeric endpoint ID")
     parser.add_argument("--project-id", type=str, default="oncogemma", help="GCP Project ID")
     parser.add_argument("--region", type=str, default="us-central1", help="GCP Region")
 
     args = parser.parse_args()
-    img_data = load_image_bytes(args.image)
+    img_data = load_png_bytes(args.image)
 
     if args.local:
-        test_local(img_data, host=args.host)
+        test_local(img_data, host=args.host, legacy=args.legacy, mpp=args.mpp)
     elif args.endpoint_id:
-        test_vertex_endpoint(img_data, args.endpoint_id, args.project_id, args.region)
+        test_vertex_endpoint(img_data, args.endpoint_id, args.project_id, args.region, legacy=args.legacy, mpp=args.mpp)
     else:
         print("Please specify either --local or --endpoint-id <ID>. See --help for details.")
