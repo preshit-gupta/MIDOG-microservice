@@ -160,6 +160,9 @@ class KongNetEngine:
                     output_type="dict",
                     patch_mode=True,
                     auto_get_mask=False,
+                    # tiatoolbox 2.0.1 leaves "probabilities" out of the dict output unless asked
+                    # (v1 then reported every detection as confidence 1.0).
+                    return_probabilities=True,
                     **run_params,
                 )
             return points_from_output(raw_output)

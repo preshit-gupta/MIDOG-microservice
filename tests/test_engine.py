@@ -82,3 +82,26 @@ def test_points_are_read_from_the_patch_mode_output():
 def test_unexpected_detector_output_is_an_error(output):
     with pytest.raises(EngineError):
         points_from_output(output)
+
+
+def test_the_engine_asks_the_detector_for_probabilities_and_passes_the_threshold():
+    """tiatoolbox 2.0.1 returns only x, y and classes unless return_probabilities=True."""
+    import threading
+
+    from engine import KongNetEngine
+
+    calls = []
+
+    class Detector:
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            return {"x": [np.array([5.0])], "y": [np.array([6.0])], "classes": [np.array([0])],
+                    "probabilities": [np.array([0.97])]}
+
+    engine = object.__new__(KongNetEngine)  # skip loading TIAToolbox
+    engine.detector, engine._lock = Detector(), threading.Lock()
+    image = np.zeros((512, 512, 3), dtype=np.uint8)
+    assert engine.predict(image, threshold_abs=0.05) == [(5.0, 6.0, 0.97)]
+    assert engine.predict(image) == [(5.0, 6.0, 0.97)]
+    assert all(call["return_probabilities"] is True and call["patch_mode"] is True for call in calls)
+    assert calls[0]["threshold_abs"] == 0.05 and "threshold_abs" not in calls[1]
