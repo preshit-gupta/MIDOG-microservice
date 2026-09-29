@@ -81,7 +81,7 @@ def patch_px_from_ioconfig(ioconfig: Any) -> int:
 def points_from_output(raw_output: Any) -> List[Point]:
     """(x, y, prob) for the one patch in a NucleusDetector patch-mode ``dict`` output.
 
-    TIAToolbox 2.1.3 returns ``{"x": [arr], "y": [arr], "classes": [arr], "probabilities": [arr]}``,
+    TIAToolbox 2.0.1 returns ``{"x": [arr], "y": [arr], "classes": [arr], "probabilities": [arr]}``,
     one array per input image.
     """
     required = ("x", "y", "probabilities")
@@ -175,7 +175,7 @@ class FakeEngine:
         input_mpp: float = 0.25,
         patch_px: int = 512,
         weights_sha256: str = "fake_sha256_kongnet_weights",
-        tiatoolbox_version: str = "2.1.3",
+        tiatoolbox_version: str = "2.0.1",
         mock_predictions: Optional[List[Point]] = None,
     ):
         self.input_mpp = input_mpp

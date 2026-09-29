@@ -24,7 +24,7 @@ This repository contains the production-grade deployment package for serving the
      ```json
      {
        "model": "KongNet_Det_MIDOG_1",
-       "tiatoolbox": "2.1.3",
+       "tiatoolbox": "2.0.1",
        "weights_sha256": "<sha256_hash>",
        "input_mpp": 0.5,
        "patch_px": 512,
