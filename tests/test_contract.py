@@ -203,3 +203,29 @@ def test_predict_legacy_path():
     assert pred["boxes"][0]["width"] == 48.0
     assert pred["boxes"][0]["height"] == 48.0
     assert pred["boxes"][0]["confidence"] == 0.95
+
+
+def test_v2_min_prob_is_the_detector_threshold_and_legacy_keeps_the_model_default(setup_fake_engine):
+    """KongNet keeps only peaks >= 0.99 unless told otherwise; v2 asks for candidates down to min_prob."""
+    client = TestClient(app)
+    client.post("/predict", json={"instances": [{"image_png_b64": make_png_b64(), "mpp": 0.25}],
+                                  "parameters": {"min_prob": 0.05}})
+    client.post("/predict", json={"instances": [{"image_png_b64": make_png_b64(), "mpp": 0.25, "min_prob": 0.3}]})
+    client.post("/predict", json={"instances": [{"image_png_b64": make_png_b64(), "mpp": 0.25}]})
+    client.post("/predict", json={"instances": [{"image_bytes": make_jpeg_b64(), "confidence_threshold": 0.25}]})
+    assert setup_fake_engine.thresholds == [0.05, 0.3, 0.01, None]
+
+
+def test_an_engine_that_cannot_load_is_reported_by_every_route(monkeypatch):
+    import engine as engine_module
+
+    def broken():
+        raise engine_module.EngineError("weights file /root/.tiatoolbox/models/KongNet_Det_MIDOG_1.pth does not exist")
+
+    set_engine(None)
+    monkeypatch.setattr(engine_module, "KongNetEngine", broken)
+    client = TestClient(app)
+    for response in (client.get("/health"), client.get("/metadata"),
+                     client.post("/predict", json={"instances": [{"image_png_b64": make_png_b64(), "mpp": 0.25}]})):
+        assert response.status_code == 503
+        assert "EngineError" in response.json()["detail"]

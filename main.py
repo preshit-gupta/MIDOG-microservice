@@ -17,49 +17,45 @@ app = FastAPI(title="MIDOG Mitosis Detector for Vertex AI (v2 Contract)")
 HEALTH_ROUTE = os.environ.get("AIP_HEALTH_ROUTE", "/health")
 PREDICT_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/predict")
 
-# Pre-initialize engine on startup if dependencies exist
+
+def loaded_engine():
+    """The engine, or 503 with the reason it could not load (logged; the next call retries)."""
+    try:
+        return get_engine()
+    except Exception as err:  # any load failure means "not ready": report it, never serve without it
+        logger.error(f"Model engine failed to load: {type(err).__name__}: {err}")
+        raise HTTPException(status_code=503, detail=f"Model engine not loaded: {type(err).__name__}")
+
+
+# Load the engine at startup; a failure is logged and /health answers 503 until it loads.
 try:
-    _ = get_engine()
-except Exception as err:
-    logger.warning(f"Engine pre-initialization notice (safe in test/mock environments): {err}")
+    get_engine()
+except Exception as err:  # the probes report it; see loaded_engine
+    logger.error(f"Engine failed to load at startup: {type(err).__name__}: {err}")
 
 
 @app.get(HEALTH_ROUTE)
 @app.get("/health")
 def health() -> Dict[str, Any]:
     """Vertex AI liveness and readiness probe."""
-    try:
-        engine = get_engine()
-    except Exception:
-        engine = None
-
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model engine not loaded")
-
+    engine = loaded_engine()
     return {
         "status": "healthy",
         "model": "KongNet_Det_MIDOG_1",
-        "weights_sha256": getattr(engine, "weights_sha256", "unknown"),
+        "weights_sha256": engine.weights_sha256,
     }
 
 
 @app.get("/metadata")
 def metadata() -> Dict[str, Any]:
     """v2 contract metadata endpoint (SPEC-06 §4)."""
-    try:
-        engine = get_engine()
-    except Exception:
-        engine = None
-
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model engine not loaded")
-
+    engine = loaded_engine()
     return {
         "model": "KongNet_Det_MIDOG_1",
-        "tiatoolbox": getattr(engine, "tiatoolbox_version", "2.1.3"),
-        "weights_sha256": getattr(engine, "weights_sha256", "unknown"),
-        "input_mpp": getattr(engine, "input_mpp", 0.25),
-        "patch_px": getattr(engine, "patch_px", 512),
+        "tiatoolbox": engine.tiatoolbox_version,
+        "weights_sha256": engine.weights_sha256,
+        "input_mpp": engine.input_mpp,
+        "patch_px": engine.patch_px,
         "output": "points",
         "deterministic": True,
         "contract": "v2",
@@ -73,13 +69,7 @@ async def predict(request: Request) -> Dict[str, Any]:
     Accepts Vertex AI prediction payloads.
     Differentiates between v2 (lossless PNG, resolution-checked) and legacy formats per instance.
     """
-    try:
-        engine = get_engine()
-    except Exception:
-        engine = None
-
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model engine not initialized")
+    engine = loaded_engine()
 
     try:
         body = await request.json()
@@ -92,7 +82,7 @@ async def predict(request: Request) -> Dict[str, Any]:
     default_min_prob = float(parameters.get("min_prob", 0.01))
     default_conf = float(parameters.get("conf", 0.25))
 
-    weights_sha = getattr(engine, "weights_sha256", "unknown")
+    weights_sha = engine.weights_sha256
 
     if not instances:
         return {"predictions": [], "model_sha256": weights_sha}
@@ -130,7 +120,7 @@ async def predict(request: Request) -> Dict[str, Any]:
                 predictions.append({"points": [], "error": f"invalid_mpp: expected float, got {mpp}"})
                 continue
 
-            expected_mpp = float(getattr(engine, "input_mpp", 0.25))
+            expected_mpp = float(engine.input_mpp)
             if abs(mpp_val - expected_mpp) / expected_mpp > 0.01:
                 predictions.append({
                     "points": [],
@@ -139,7 +129,7 @@ async def predict(request: Request) -> Dict[str, Any]:
                 continue
 
             # Check image size
-            expected_px = int(getattr(engine, "patch_px", 512))
+            expected_px = int(engine.patch_px)
             try:
                 img = Image.open(io.BytesIO(raw_bytes))
                 if img.width != expected_px or img.height != expected_px:
@@ -153,10 +143,11 @@ async def predict(request: Request) -> Dict[str, Any]:
                 predictions.append({"points": [], "error": f"image_decode_error: {e}"})
                 continue
 
-            # Predict and filter by min_prob
+            # Predict and filter by min_prob. min_prob is also KongNet's post-processing peak
+            # threshold (its own default is 0.99), so candidates down to min_prob are returned.
             item_min_prob = float(item.get("min_prob", default_min_prob))
             try:
-                raw_points = engine.predict(img_rgb)
+                raw_points = engine.predict(img_rgb, threshold_abs=item_min_prob)
                 filtered_points = [
                     {
                         "x": round(float(x), 2),
@@ -185,6 +176,7 @@ async def predict(request: Request) -> Dict[str, Any]:
                 img_rgb = np.array(img)
 
                 item_conf = float(item.get("confidence_threshold", default_conf))
+                # Unchanged v5 behaviour: KongNet's own post-processing threshold (0.99).
                 raw_points = engine.predict(img_rgb)
 
                 boxes = [
