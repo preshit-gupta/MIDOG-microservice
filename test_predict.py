@@ -57,7 +57,7 @@ def load_png_bytes(image_path: str = None) -> bytes:
     return create_synthetic_png_tile()
 
 
-def test_local(image_bytes: bytes, host: str = "http://localhost:8080", legacy: bool = False, mpp: float = 0.25):
+def test_local(image_bytes: bytes, host: str = "http://localhost:8080", legacy: bool = False, mpp: float = 0.5):
     print(f"\n[INFO] Testing local server at: {host}")
     b64_str = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -134,7 +134,7 @@ def test_local(image_bytes: bytes, host: str = "http://localhost:8080", legacy: 
         print(f"[PREDICTION ERROR] Failed to run prediction: {e}")
 
 
-def test_vertex_endpoint(image_bytes: bytes, endpoint_id: str, project_id: str, region: str, legacy: bool = False, mpp: float = 0.25):
+def test_vertex_endpoint(image_bytes: bytes, endpoint_id: str, project_id: str, region: str, legacy: bool = False, mpp: float = 0.5):
     print(f"\n[INFO] Testing Vertex AI Endpoint: {endpoint_id} in {region} ({project_id})")
     b64_str = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="http://localhost:8080", help="Local server URL")
     parser.add_argument("--image", type=str, default=None, help="Path to input image/tile (PNG)")
     parser.add_argument("--legacy", action="store_true", help="Send legacy v5 format request")
-    parser.add_argument("--mpp", type=float, default=0.25, help="MPP value for v2 request")
+    parser.add_argument("--mpp", type=float, default=0.5, help="MPP value for v2 request (the model's input_mpp, see /metadata)")
     parser.add_argument("--endpoint-id", type=str, default=None, help="Vertex AI numeric endpoint ID")
     parser.add_argument("--project-id", type=str, default="oncogemma", help="GCP Project ID")
     parser.add_argument("--region", type=str, default="us-central1", help="GCP Region")

@@ -1,20 +1,106 @@
-import os
+"""KongNet_Det_MIDOG_1 through TIAToolbox, with the v6 guarantees (SPEC-06 §4).
+
+The engine starts only if it knows the model's input resolution and patch size (from
+the model's own TIAToolbox IO config) and the SHA-256 of the weights it loaded; the
+service answers 503 otherwise. Detector output without a probability is an error,
+never a default.
+"""
 import hashlib
 import logging
-from typing import List, Tuple, Optional, Any
+import os
+import tempfile
+import threading
+from pathlib import Path
+from typing import Any, List, Optional, Tuple
+
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger("midog-detector")
 
+MODEL_NAME = "KongNet_Det_MIDOG_1"
+# Written by scripts/prewarm_weights.py during the image build.
+WEIGHTS_SHA256_FILE = Path(os.environ.get("WEIGHTS_SHA256_FILE", "/app/WEIGHTS_SHA256"))
 
-def compute_file_sha256(path: str) -> str:
+Point = Tuple[float, float, float]
+
+
+class EngineError(RuntimeError):
+    """The detector cannot run, or produced output that cannot be trusted."""
+
+
+def compute_file_sha256(path) -> str:
     """Computes SHA-256 hash of a file."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while chunk := f.read(65536):
             h.update(chunk)
     return h.hexdigest()
+
+
+def weights_path(tiatoolbox_home) -> Path:
+    """Where TIAToolbox caches the pretrained weights: models/<name>.pth under TIATOOLBOX_HOME."""
+    return Path(tiatoolbox_home) / "models" / f"{MODEL_NAME}.pth"
+
+
+def loaded_weights_sha256(weights: Path, recorded: Path = WEIGHTS_SHA256_FILE) -> str:
+    """SHA-256 of the weights file. It must match the hash the image build recorded, if there is one."""
+    if not weights.is_file():
+        raise EngineError(f"weights file {weights} does not exist")
+    sha = compute_file_sha256(weights)
+    if recorded.is_file():
+        expected = recorded.read_text(encoding="utf-8").strip()
+        if expected != sha:
+            raise EngineError(f"weights {weights} have sha256 {sha}, but the image build recorded {expected}")
+    return sha
+
+
+def input_mpp_from_ioconfig(ioconfig: Any) -> float:
+    """The model's input resolution in µm/px, from its TIAToolbox IO config."""
+    resolutions = getattr(ioconfig, "input_resolutions", None)
+    if not resolutions:
+        raise EngineError(f"{MODEL_NAME} IO config has no input resolution")
+    resolution = resolutions[0]
+    if isinstance(resolution, dict):
+        units, value = resolution.get("units"), resolution.get("resolution")
+    else:
+        units, value = getattr(resolution, "units", None), getattr(resolution, "resolution", None)
+    if units != "mpp" or value is None:
+        raise EngineError(f"{MODEL_NAME} input resolution is {resolution!r}, not a resolution in mpp")
+    return float(value)
+
+
+def patch_px_from_ioconfig(ioconfig: Any) -> int:
+    """The model's square input patch size in pixels, from its TIAToolbox IO config."""
+    shape = getattr(ioconfig, "patch_input_shape", None)
+    if shape is None or len(shape) != 2 or int(shape[0]) != int(shape[1]):
+        raise EngineError(f"{MODEL_NAME} IO config patch_input_shape is {shape!r}, not a square patch")
+    return int(shape[0])
+
+
+def points_from_output(raw_output: Any) -> List[Point]:
+    """(x, y, prob) for the one patch in a NucleusDetector patch-mode ``dict`` output.
+
+    TIAToolbox 2.0.1 returns ``{"x": [arr], "y": [arr], "classes": [arr], "probabilities": [arr]}``,
+    one array per input image.
+    """
+    required = ("x", "y", "probabilities")
+    if not isinstance(raw_output, dict) or any(key not in raw_output for key in required):
+        found = sorted(raw_output) if isinstance(raw_output, dict) else type(raw_output).__name__
+        raise EngineError(f"unexpected detector output, need {required}: {found}")
+    columns = []
+    for key in required:
+        per_image = raw_output[key]
+        if len(per_image) != 1:
+            raise EngineError(f"detector output '{key}' has {len(per_image)} entries for one patch")
+        column = per_image[0]
+        if hasattr(column, "compute"):
+            column = column.compute()
+        columns.append(np.asarray(column, dtype=float).ravel())
+    xs, ys, probs = columns
+    if not len(xs) == len(ys) == len(probs):
+        raise EngineError(f"detector output lengths differ: x {len(xs)}, y {len(ys)}, probabilities {len(probs)}")
+    return [(float(x), float(y), float(p)) for x, y, p in zip(xs, ys, probs)]
 
 
 class KongNetEngine:
@@ -24,7 +110,10 @@ class KongNetEngine:
     """
 
     def __init__(self, device: Optional[str] = None):
+        import tiatoolbox
         import torch
+        from tiatoolbox import rcParam
+        from tiatoolbox.models.engine.nucleus_detector import NucleusDetector
 
         # Deterministic PyTorch settings (SPEC-06 §4)
         torch.use_deterministic_algorithms(True, warn_only=True)
@@ -33,172 +122,49 @@ class KongNetEngine:
             torch.backends.cudnn.deterministic = True
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.patch_px = 512
 
-        from tiatoolbox.models.engine.nucleus_detector import NucleusDetector
-        import tiatoolbox
-
-        logger.info(f"Loading TIAToolbox NucleusDetector(model='KongNet_Det_MIDOG_1') on {self.device}...")
+        logger.info(f"Loading TIAToolbox NucleusDetector(model='{MODEL_NAME}') on {self.device}...")
         self.detector = NucleusDetector(
-            model="KongNet_Det_MIDOG_1",
+            model=MODEL_NAME,
             batch_size=1,
             device=self.device,
             verbose=False,
         )
-        self.tiatoolbox_version = getattr(tiatoolbox, "__version__", "2.1.3")
+        self.tiatoolbox_version = tiatoolbox.__version__
+        self.input_mpp = input_mpp_from_ioconfig(self.detector.ioconfig)
+        self.patch_px = patch_px_from_ioconfig(self.detector.ioconfig)
+        self.weights_sha256 = loaded_weights_sha256(weights_path(rcParam["TIATOOLBOX_HOME"]))
+        # One patch at a time through the detector: fixed batch size, deterministic order.
+        self._lock = threading.Lock()
+        logger.info(
+            f"KongNetEngine ready: tiatoolbox {self.tiatoolbox_version}, input {self.input_mpp} um/px, "
+            f"{self.patch_px} px patches, weights sha256 {self.weights_sha256}"
+        )
 
-        # Determine input resolution
-        self.input_mpp = self._determine_input_mpp()
-        logger.info(f"KongNetEngine active input_mpp: {self.input_mpp}")
-
-        # Determine weights SHA256
-        self.weights_sha256 = self._determine_weights_sha256()
-        logger.info(f"KongNetEngine weights SHA256: {self.weights_sha256}")
-
-    def _determine_input_mpp(self) -> float:
-        """Inspects ioconfig if available or falls back to MODEL_INPUT_MPP / 0.25."""
-        env_mpp = os.environ.get("MODEL_INPUT_MPP")
-        if env_mpp is not None:
-            try:
-                val = float(env_mpp)
-                logger.info(f"Using MODEL_INPUT_MPP from environment: {val}")
-                return val
-            except ValueError:
-                pass
-
-        try:
-            if hasattr(self.detector, "ioconfig") and self.detector.ioconfig:
-                ioconfig = self.detector.ioconfig
-                if hasattr(ioconfig, "input_resolutions") and ioconfig.input_resolutions:
-                    res_entry = ioconfig.input_resolutions[0]
-                    if isinstance(res_entry, dict) and "resolution" in res_entry:
-                        return float(res_entry["resolution"])
-                    if hasattr(res_entry, "resolution"):
-                        return float(res_entry.resolution)
-        except Exception as e:
-            logger.warning(f"Could not read resolution from detector.ioconfig: {e}")
-
-        # Default resolution per SPEC-06 §4
-        return 0.25
-
-    def _determine_weights_sha256(self) -> str:
-        """Finds cached weights file or reads pre-warmed hash."""
-        # 1. Pre-warmed container file
-        for cand in ["/app/WEIGHTS_SHA256", "WEIGHTS_SHA256"]:
-            if os.path.exists(cand):
-                try:
-                    with open(cand, "r") as f:
-                        sha = f.read().strip()
-                        if sha:
-                            return sha
-                except Exception:
-                    pass
-
-        # 2. Search TIAToolbox cache directory
-        try:
-            from tiatoolbox import constants
-            cache_dir = getattr(constants, "TIATOOLBOX_CACHE_DIR", os.path.expanduser("~/.tiatoolbox"))
-            if os.path.exists(cache_dir):
-                for root, _, files in os.walk(cache_dir):
-                    for file in files:
-                        if "KongNet_Det_MIDOG_1" in file and file.endswith((".pth", ".pt", ".tar", ".bin")):
-                            weights_path = os.path.join(root, file)
-                            sha = compute_file_sha256(weights_path)
-                            logger.info(f"Found KongNet weights at {weights_path}: {sha}")
-                            return sha
-        except Exception as e:
-            logger.warning(f"Error scanning tiatoolbox cache directory: {e}")
-
-        # Fallback dummy hash to preserve contract shape if untracked
-        return "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-    def predict(self, img_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
+    def predict(self, img_rgb: np.ndarray, threshold_abs: Optional[float] = None) -> List[Point]:
         """
-        Runs inference on an RGB numpy array (512x512).
+        Runs inference on an RGB numpy array (patch_px x patch_px).
         Returns list of (x, y, prob).
-        """
-        import tempfile
 
-        img = Image.fromarray(img_rgb)
+        ``threshold_abs`` is the peak threshold of KongNet's post-processing. None keeps
+        the model's own value (0.99 for KongNet_Det_MIDOG_1), as the legacy contract did.
+        """
+        run_params = {} if threshold_abs is None else {"threshold_abs": float(threshold_abs)}
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
             tmp_path = tmp_file.name
-            img.save(tmp_path, format="PNG")
-
-        results: List[Tuple[float, float, float]] = []
         try:
-            raw_output = self.detector.run(
-                images=[tmp_path],
-                output_type="dict",
-                patch_mode=True,
-                auto_get_mask=False,
-            )
-
-            if isinstance(raw_output, dict) and "x" in raw_output and "y" in raw_output:
-                xs_list = raw_output.get("x", [])
-                ys_list = raw_output.get("y", [])
-                probs_list = raw_output.get("probabilities", [])
-
-                if len(xs_list) > 0 and len(ys_list) > 0:
-                    xs = xs_list[0]
-                    ys = ys_list[0]
-                    probs = probs_list[0] if len(probs_list) > 0 else None
-
-                    if hasattr(xs, "compute"):
-                        xs = xs.compute()
-                    if hasattr(ys, "compute"):
-                        ys = ys.compute()
-                    if probs is not None and hasattr(probs, "compute"):
-                        probs = probs.compute()
-
-                    xs = np.asarray(xs)
-                    ys = np.asarray(ys)
-                    probs = np.asarray(probs) if probs is not None else np.ones_like(xs, dtype=float)
-
-                    for x_val, y_val, p_val in zip(xs, ys, probs):
-                        results.append((float(x_val), float(y_val), float(p_val)))
-                    return results
-
-            # Fallback parsing for alternative TIAToolbox dictionary format
-            inst_dict = {}
-            if isinstance(raw_output, dict):
-                if tmp_path in raw_output:
-                    inst_dict = raw_output[tmp_path]
-                elif 0 in raw_output:
-                    inst_dict = raw_output[0]
-                else:
-                    for v in raw_output.values():
-                        if isinstance(v, dict):
-                            inst_dict = v
-                            break
-            elif isinstance(raw_output, (list, tuple)) and len(raw_output) > 0:
-                inst_dict = raw_output[0]
-
-            if isinstance(inst_dict, dict):
-                for _, inst in inst_dict.items():
-                    if not isinstance(inst, dict):
-                        continue
-                    prob = float(inst.get("prob", inst.get("confidence", 1.0)))
-                    centroid = inst.get("centroid")
-                    box = inst.get("box")
-
-                    if centroid is not None and len(centroid) >= 2:
-                        cx = float(centroid[0])
-                        cy = float(centroid[1])
-                    elif box is not None and len(box) >= 4:
-                        cx = float(box[0] + box[2]) / 2.0
-                        cy = float(box[1] + box[3]) / 2.0
-                    else:
-                        continue
-                    results.append((cx, cy, prob))
-
+            Image.fromarray(img_rgb).save(tmp_path, format="PNG")
+            with self._lock:
+                raw_output = self.detector.run(
+                    images=[tmp_path],
+                    output_type="dict",
+                    patch_mode=True,
+                    auto_get_mask=False,
+                    **run_params,
+                )
+            return points_from_output(raw_output)
         finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-
-        return results
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 class FakeEngine:
@@ -209,8 +175,8 @@ class FakeEngine:
         input_mpp: float = 0.25,
         patch_px: int = 512,
         weights_sha256: str = "fake_sha256_kongnet_weights",
-        tiatoolbox_version: str = "2.1.3",
-        mock_predictions: Optional[List[Tuple[float, float, float]]] = None,
+        tiatoolbox_version: str = "2.0.1",
+        mock_predictions: Optional[List[Point]] = None,
     ):
         self.input_mpp = input_mpp
         self.patch_px = patch_px
@@ -225,8 +191,11 @@ class FakeEngine:
                 (300.0, 300.0, 0.005),  # Below default min_prob 0.01
             ]
         )
+        # The post-processing threshold of every predict call, for the contract tests.
+        self.thresholds: List[Optional[float]] = []
 
-    def predict(self, img_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
+    def predict(self, img_rgb: np.ndarray, threshold_abs: Optional[float] = None) -> List[Point]:
+        self.thresholds.append(threshold_abs)
         return self.mock_predictions
 
 
