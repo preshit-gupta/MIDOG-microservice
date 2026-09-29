@@ -229,3 +229,12 @@ def test_an_engine_that_cannot_load_is_reported_by_every_route(monkeypatch):
                      client.post("/predict", json={"instances": [{"image_png_b64": make_png_b64(), "mpp": 0.25}]})):
         assert response.status_code == 503
         assert "EngineError" in response.json()["detail"]
+
+
+def test_the_service_takes_0_25_um_per_px_and_refuses_0_5(setup_fake_engine):
+    """KongNet reaches F1 0.87 at native 40x and at most 0.27 at 0.5 um/px (MIDOG++ 094, SPEC-06 AC5)."""
+    client = TestClient(app)
+    meta = client.get("/metadata").json()
+    assert meta["input_mpp"] == 0.25 and meta["ioconfig_input_mpp"] == 0.5
+    refused = client.post("/predict", json={"instances": [{"image_png_b64": make_png_b64(), "mpp": 0.5}]}).json()
+    assert refused["predictions"][0]["error"] == "mpp_mismatch: expected 0.25, got 0.5"

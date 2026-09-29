@@ -1,9 +1,17 @@
 """KongNet_Det_MIDOG_1 through TIAToolbox, with the v6 guarantees (SPEC-06 §4).
 
-The engine starts only if it knows the model's input resolution and patch size (from
-the model's own TIAToolbox IO config) and the SHA-256 of the weights it loaded; the
-service answers 503 otherwise. Detector output without a probability is an error,
-never a default.
+The engine starts only if it knows the model's patch size (from the model's own
+TIAToolbox IO config) and the SHA-256 of the weights it loaded; the service answers 503
+otherwise. Detector output without a probability is an error, never a default.
+
+Two facts were measured on the live endpoint against MIDOG++ image 094 (82 labelled
+mitotic figures, 0.2298 um/px) on 2026-09-29, with tiatoolbox 2.0.1:
+- Resolution: native 40x input (~0.25 um/px) reaches F1 0.87; the same image
+  downsampled to the 0.5 um/px in the model's IO config reaches at most F1 0.27. The
+  service therefore takes 0.25 um/px (SPEC-06 AC5) and reports the IO config's value only
+  for transparency.
+- Coordinates: patch-mode output has x and y transposed. Taken as returned, 11 of 104
+  detections match a labelled figure (F1 0.12); swapped back, 75 of 90 do (F1 0.87).
 """
 import hashlib
 import logging
@@ -21,6 +29,8 @@ logger = logging.getLogger("midog-detector")
 MODEL_NAME = "KongNet_Det_MIDOG_1"
 # Written by scripts/prewarm_weights.py during the image build.
 WEIGHTS_SHA256_FILE = Path(os.environ.get("WEIGHTS_SHA256_FILE", "/app/WEIGHTS_SHA256"))
+# The resolution the model is served at (see the module docstring for the measurement).
+MODEL_INPUT_MPP = 0.25
 
 Point = Tuple[float, float, float]
 
@@ -79,10 +89,11 @@ def patch_px_from_ioconfig(ioconfig: Any) -> int:
 
 
 def points_from_output(raw_output: Any) -> List[Point]:
-    """(x, y, prob) for the one patch in a NucleusDetector patch-mode ``dict`` output.
+    """(x, y, prob) in input-image pixels for the one patch in a NucleusDetector patch-mode output.
 
     TIAToolbox 2.0.1 returns ``{"x": [arr], "y": [arr], "classes": [arr], "probabilities": [arr]}``,
-    one array per input image.
+    one array per input image, with the two coordinate axes transposed: its "y" array holds
+    the image column (x) and its "x" array the image row (y). See the module docstring.
     """
     required = ("x", "y", "probabilities")
     if not isinstance(raw_output, dict) or any(key not in raw_output for key in required):
@@ -100,7 +111,7 @@ def points_from_output(raw_output: Any) -> List[Point]:
     xs, ys, probs = columns
     if not len(xs) == len(ys) == len(probs):
         raise EngineError(f"detector output lengths differ: x {len(xs)}, y {len(ys)}, probabilities {len(probs)}")
-    return [(float(x), float(y), float(p)) for x, y, p in zip(xs, ys, probs)]
+    return [(float(col), float(row), float(p)) for row, col, p in zip(xs, ys, probs)]
 
 
 class KongNetEngine:
@@ -131,13 +142,15 @@ class KongNetEngine:
             verbose=False,
         )
         self.tiatoolbox_version = tiatoolbox.__version__
-        self.input_mpp = input_mpp_from_ioconfig(self.detector.ioconfig)
+        self.input_mpp = MODEL_INPUT_MPP
+        self.ioconfig_input_mpp = input_mpp_from_ioconfig(self.detector.ioconfig)
         self.patch_px = patch_px_from_ioconfig(self.detector.ioconfig)
         self.weights_sha256 = loaded_weights_sha256(weights_path(rcParam["TIATOOLBOX_HOME"]))
         # One patch at a time through the detector: fixed batch size, deterministic order.
         self._lock = threading.Lock()
         logger.info(
-            f"KongNetEngine ready: tiatoolbox {self.tiatoolbox_version}, input {self.input_mpp} um/px, "
+            f"KongNetEngine ready: tiatoolbox {self.tiatoolbox_version}, input {self.input_mpp} um/px "
+            f"(IO config says {self.ioconfig_input_mpp}), "
             f"{self.patch_px} px patches, weights sha256 {self.weights_sha256}"
         )
 
@@ -182,6 +195,7 @@ class FakeEngine:
         mock_predictions: Optional[List[Point]] = None,
     ):
         self.input_mpp = input_mpp
+        self.ioconfig_input_mpp = 0.5
         self.patch_px = patch_px
         self.weights_sha256 = weights_sha256
         self.tiatoolbox_version = tiatoolbox_version
