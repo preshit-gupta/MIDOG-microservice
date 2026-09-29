@@ -58,14 +58,15 @@ def test_weights_hash_is_the_file_hash_and_must_match_the_build(tmp_path):
         loaded_weights_sha256(weights, recorded)
 
 
-def test_points_are_read_from_the_patch_mode_output():
+def test_points_are_read_with_the_axes_swapped_back():
+    """tiatoolbox 2.0.1 patch mode returns the image row as "x" and the column as "y" (measured on MIDOG++ 094)."""
     output = {
-        "x": [np.array([10.0, 20.5])],
-        "y": [np.array([30.0, 40.0])],
+        "x": [np.array([10.0, 20.5])],   # image rows
+        "y": [np.array([30.0, 40.0])],   # image columns
         "classes": [np.array([0, 0])],
         "probabilities": [np.array([0.995, 0.42])],
     }
-    assert points_from_output(output) == [(10.0, 30.0, 0.995), (20.5, 40.0, 0.42)]
+    assert points_from_output(output) == [(30.0, 10.0, 0.995), (40.0, 20.5, 0.42)]
     assert points_from_output({"x": [[]], "y": [[]], "probabilities": [[]]}) == []
 
 
@@ -82,3 +83,26 @@ def test_points_are_read_from_the_patch_mode_output():
 def test_unexpected_detector_output_is_an_error(output):
     with pytest.raises(EngineError):
         points_from_output(output)
+
+
+def test_the_engine_asks_the_detector_for_probabilities_and_passes_the_threshold():
+    """tiatoolbox 2.0.1 returns only x, y and classes unless return_probabilities=True."""
+    import threading
+
+    from engine import KongNetEngine
+
+    calls = []
+
+    class Detector:
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            return {"x": [np.array([5.0])], "y": [np.array([6.0])], "classes": [np.array([0])],
+                    "probabilities": [np.array([0.97])]}
+
+    engine = object.__new__(KongNetEngine)  # skip loading TIAToolbox
+    engine.detector, engine._lock = Detector(), threading.Lock()
+    image = np.zeros((512, 512, 3), dtype=np.uint8)
+    assert engine.predict(image, threshold_abs=0.05) == [(6.0, 5.0, 0.97)]
+    assert engine.predict(image) == [(6.0, 5.0, 0.97)]
+    assert all(call["return_probabilities"] is True and call["patch_mode"] is True for call in calls)
+    assert calls[0]["threshold_abs"] == 0.05 and "threshold_abs" not in calls[1]

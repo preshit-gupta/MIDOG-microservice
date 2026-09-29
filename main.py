@@ -55,6 +55,7 @@ def metadata() -> Dict[str, Any]:
         "tiatoolbox": engine.tiatoolbox_version,
         "weights_sha256": engine.weights_sha256,
         "input_mpp": engine.input_mpp,
+        "ioconfig_input_mpp": engine.ioconfig_input_mpp,
         "patch_px": engine.patch_px,
         "output": "points",
         "deterministic": True,

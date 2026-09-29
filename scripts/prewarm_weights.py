@@ -12,6 +12,7 @@ from tiatoolbox import rcParam  # noqa: E402
 from tiatoolbox.models.engine.nucleus_detector import NucleusDetector  # noqa: E402
 
 from engine import (  # noqa: E402
+    MODEL_INPUT_MPP,
     MODEL_NAME,
     WEIGHTS_SHA256_FILE,
     compute_file_sha256,
@@ -27,10 +28,11 @@ def main() -> None:
     if not weights.is_file():
         raise SystemExit(f"{MODEL_NAME}: weights not found at {weights} after loading the model")
     sha = compute_file_sha256(weights)
-    input_mpp = input_mpp_from_ioconfig(detector.ioconfig)
+    ioconfig_mpp = input_mpp_from_ioconfig(detector.ioconfig)
     patch_px = patch_px_from_ioconfig(detector.ioconfig)
     WEIGHTS_SHA256_FILE.write_text(sha + "\n", encoding="utf-8")
-    print(f"{MODEL_NAME}: weights {weights} sha256 {sha}; input {input_mpp} um/px, {patch_px} px patches")
+    print(f"{MODEL_NAME}: weights {weights} sha256 {sha}; served at {MODEL_INPUT_MPP} um/px "
+          f"(IO config says {ioconfig_mpp}), {patch_px} px patches")
 
 
 if __name__ == "__main__":
