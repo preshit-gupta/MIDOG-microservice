@@ -1,5 +1,6 @@
 import base64
 import io
+import math
 import os
 import logging
 from typing import Any, Dict, List
@@ -7,12 +8,12 @@ from fastapi import FastAPI, Request, HTTPException
 from PIL import Image
 import numpy as np
 
-from engine import get_engine
+from engine import NMS_RADIUS_UM, PEAK_MIN_DISTANCE_UM, float32_sigmoid, get_engine, logit_of
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("midog-detector")
 
-app = FastAPI(title="MIDOG Mitosis Detector for Vertex AI (v2 Contract)")
+app = FastAPI(title="MIDOG Mitosis Detector for Vertex AI (v3 Contract)")
 
 HEALTH_ROUTE = os.environ.get("AIP_HEALTH_ROUTE", "/health")
 PREDICT_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/predict")
@@ -48,7 +49,7 @@ def health() -> Dict[str, Any]:
 
 @app.get("/metadata")
 def metadata() -> Dict[str, Any]:
-    """v2 contract metadata endpoint (SPEC-06 §4)."""
+    """Contract metadata (SPEC-06 §4; v3: OncoGemma v7.2 Stage 4 spec §4.2)."""
     engine = loaded_engine()
     return {
         "model": "KongNet_Det_MIDOG_1",
@@ -58,8 +59,13 @@ def metadata() -> Dict[str, Any]:
         "ioconfig_input_mpp": engine.ioconfig_input_mpp,
         "patch_px": engine.patch_px,
         "output": "points",
+        "point_fields": ["x", "y", "prob", "logit"],
         "deterministic": True,
-        "contract": "v2",
+        "contract": "v3",
+        "peak_rule": "logit_peaks",
+        "peak_min_distance_um": PEAK_MIN_DISTANCE_UM,
+        "nms_radius_um": NMS_RADIUS_UM,
+        "preproc": "imagenet_mean_std",
     }
 
 
@@ -68,7 +74,8 @@ def metadata() -> Dict[str, Any]:
 async def predict(request: Request) -> Dict[str, Any]:
     """
     Accepts Vertex AI prediction payloads.
-    Differentiates between v2 (lossless PNG, resolution-checked) and legacy formats per instance.
+    Differentiates between v2/v3 (lossless PNG, resolution-checked; v3 points also carry their
+    logit) and legacy formats per instance.
     """
     engine = loaded_engine()
 
@@ -91,7 +98,7 @@ async def predict(request: Request) -> Dict[str, Any]:
     predictions: List[Dict[str, Any]] = []
 
     for idx, item in enumerate(instances):
-        # 1. v2 Contract Format: image_png_b64 + mpp
+        # 1. v2/v3 Contract Format: image_png_b64 + mpp (v3 answers are v2 answers plus logits)
         if "image_png_b64" in item:
             b64_str = item.get("image_png_b64")
             if not b64_str:
@@ -144,23 +151,29 @@ async def predict(request: Request) -> Dict[str, Any]:
                 predictions.append({"points": [], "error": f"image_decode_error: {e}"})
                 continue
 
-            # Predict and filter by min_prob. min_prob is also KongNet's post-processing peak
-            # threshold (its own default is 0.99), so candidates down to min_prob are returned.
-            item_min_prob = float(item.get("min_prob", default_min_prob))
+            # Contract v3: peaks of the logit map at or above logit(min_prob), each with its logit
+            # and the float32 sigmoid of it as prob (what v2 returned). See engine.py.
             try:
-                raw_points = engine.predict(img_rgb, threshold_abs=item_min_prob)
-                filtered_points = [
-                    {
+                item_min_prob = float(item.get("min_prob", default_min_prob))
+                min_logit = logit_of(item_min_prob)
+            except (TypeError, ValueError) as e:
+                predictions.append({"points": [], "error": f"invalid_min_prob: {e}"})
+                continue
+            try:
+                raw_points = engine.predict_logits(img_rgb, min_logit=min_logit)
+                points = []
+                for x, y, logit in raw_points:
+                    if not math.isfinite(float(logit)):
+                        raise ValueError(f"non-finite logit {logit} at ({x}, {y})")
+                    points.append({
                         "x": round(float(x), 2),
                         "y": round(float(y), 2),
-                        "prob": round(float(p), 4),
-                    }
-                    for x, y, p in raw_points
-                    if float(p) >= item_min_prob
-                ]
-                predictions.append({"points": filtered_points, "error": None})
+                        "prob": round(float32_sigmoid(logit), 4),
+                        "logit": round(float(logit), 4),
+                    })
+                predictions.append({"points": points, "error": None})
             except Exception as e:
-                logger.error(f"Inference error on v2 instance #{idx}: {e}")
+                logger.error(f"Inference error on v3 instance #{idx}: {e}")
                 predictions.append({"points": [], "error": f"inference_error: {e}"})
 
         # 2. Legacy v5 Format: image_bytes
