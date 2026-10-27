@@ -32,7 +32,12 @@ COPY scripts/golden_logits.py scripts/
 RUN python scripts/golden_logits.py --check tests/fixtures/golden_logits.json
 
 # Copy application files
-COPY main.py ./
+COPY main.py tile_pack.py ./
+
+# Throughput (OncoGemma v7.2 spec §12.1). The deploy script sets both per endpoint; fp16 refuses to load
+# unless the golden tiles match the fp32 record on the serving GPU.
+ENV MIDOG_MAX_BATCH=16
+ENV MIDOG_PRECISION=fp32
 
 EXPOSE 8080
 ENV PORT=8080

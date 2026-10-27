@@ -9,11 +9,17 @@
     4. Submits container build using Google Cloud Build.
     5. Registers the container in Vertex AI Model Registry.
     6. Creates a Vertex AI Endpoint.
-    7. Deploys the model to the Endpoint (T4 GPU by default, or CPU).
+    7. Deploys the model to the Endpoint (T4 GPU by default, an L4, or CPU).
     8. Prints the Endpoint ID and the OncoGemma .env configuration line.
+
+    Throughput (OncoGemma v7.2 Stage 3 spec §12.1): -Gpu l4 serves on g2-standard-4 + L4; -MaxReplicas above
+    -MinReplicas autoscales on GPU duty cycle (-DutyCycleTarget); -MaxBatch sets the patches per forward pass;
+    -Precision fp16 runs under autocast and the container refuses to start unless the golden tiles match the fp32
+    record on that GPU. Measure G3-3 before and after each change; the calibration card is fitted on fp32 logits.
 
 .EXAMPLE
     .\deploy.ps1 -ProjectId "oncogemma" -Region "us-central1" -DeployGPU
+    .\deploy.ps1 -Gpu l4 -MinReplicas 1 -MaxReplicas 3 -MaxBatch 32
     .\deploy.ps1 -DeployCPU
 #>
 
@@ -21,11 +27,23 @@ param(
     [string]$ProjectId = "oncogemma",
     [string]$Region = "us-central1",
     [string]$RepoName = "oncogemma-repo",
-    [string]$ImageTag = "midog-detector:v2",
+    [string]$ImageTag = "midog-detector:v3.1",
     [string]$EndpointName = "mitosis-detector-endpoint",
-    [string]$ModelDisplayName = "midog-kongnet-v2",
+    [string]$ModelDisplayName = "midog-kongnet-v3-1",
     [switch]$DeployGPU,
-    [switch]$DeployCPU
+    [switch]$DeployCPU,
+    [ValidateSet("t4", "l4")]
+    [string]$Gpu = "t4",
+    [ValidateRange(1, 10)]
+    [int]$MinReplicas = 1,
+    [ValidateRange(1, 10)]
+    [int]$MaxReplicas = 1,
+    [ValidateRange(10, 100)]
+    [int]$DutyCycleTarget = 60,
+    [ValidateRange(1, 64)]
+    [int]$MaxBatch = 16,
+    [ValidateSet("fp32", "fp16")]
+    [string]$Precision = "fp32"
 )
 
 # Default to GPU if neither or both specified
@@ -33,6 +51,18 @@ $useGpu = $true
 if ($DeployCPU -and -not $DeployGPU) {
     $useGpu = $false
 }
+if ($MaxReplicas -lt $MinReplicas) {
+    Write-Host "[ERROR] -MaxReplicas ($MaxReplicas) is below -MinReplicas ($MinReplicas)." -ForegroundColor Red
+    exit 1
+}
+if ($Precision -eq "fp16" -and -not $useGpu) {
+    Write-Host "[ERROR] -Precision fp16 needs a GPU." -ForegroundColor Red
+    exit 1
+}
+$gpuSpec = @{
+    "t4" = @{ Machine = "n1-standard-4"; Accelerator = "type=nvidia-tesla-t4,count=1"; Label = "NVIDIA T4 GPU (n1-standard-4)" }
+    "l4" = @{ Machine = "g2-standard-4"; Accelerator = "type=nvidia-l4,count=1"; Label = "NVIDIA L4 GPU (g2-standard-4)" }
+}[$Gpu]
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "  MIDOG Mitosis Detector Vertex AI Deployment Pipeline (v2)" -ForegroundColor Cyan
@@ -42,7 +72,9 @@ Write-Host "Region      : $Region"
 Write-Host "Repository  : $RepoName"
 Write-Host "Image Tag   : $ImageTag"
 Write-Host "Model Engine: KongNet_Det_MIDOG_1 (1st Place Challenge Winner)"
-Write-Host "Hardware    : $(if ($useGpu) {'NVIDIA T4 GPU (n1-standard-4)'} else {'CPU Only (e2-standard-4)'})"
+Write-Host "Hardware    : $(if ($useGpu) {$gpuSpec.Label} else {'CPU Only (e2-standard-4)'})"
+Write-Host "Replicas    : $MinReplicas-$MaxReplicas$(if ($MaxReplicas -gt $MinReplicas) {" (GPU duty cycle target $DutyCycleTarget%)"})"
+Write-Host "Batch       : $MaxBatch patches per forward pass, $Precision"
 Write-Host "=========================================================="
 
 # 1. Verify model engine
@@ -93,6 +125,7 @@ $uploadOutput = gcloud ai models upload `
     --container-predict-route="/predict" `
     --container-health-route="/health" `
     --container-ports=8080 `
+    --container-env-vars="MIDOG_MAX_BATCH=$MaxBatch,MIDOG_PRECISION=$Precision" `
     --format="value(model)"
 
 Write-Host "Model uploaded successfully: $uploadOutput" -ForegroundColor Cyan
@@ -145,15 +178,21 @@ if ($deployedModels) {
 # 8. Deploy Model to the Endpoint
 Write-Host "`nDeploying model to Endpoint..." -ForegroundColor Green
 if ($useGpu) {
-    Write-Host "Deploying with 1x NVIDIA Tesla T4 GPU on n1-standard-4..." -ForegroundColor Yellow
-    gcloud ai endpoints deploy-model $ENDPOINT_ID `
-        --region=$Region `
-        --model=$MODEL_ID `
-        --display-name="${ModelDisplayName}-gpu-deploy" `
-        --machine-type="n1-standard-4" `
-        --accelerator="type=nvidia-tesla-t4,count=1" `
-        --min-replica-count=1 `
-        --max-replica-count=1
+    Write-Host "Deploying with $($gpuSpec.Label), $MinReplicas-$MaxReplicas replicas..." -ForegroundColor Yellow
+    $deployArgs = @(
+        "ai", "endpoints", "deploy-model", $ENDPOINT_ID,
+        "--region=$Region",
+        "--model=$MODEL_ID",
+        "--display-name=${ModelDisplayName}-$Gpu-deploy",
+        "--machine-type=$($gpuSpec.Machine)",
+        "--accelerator=$($gpuSpec.Accelerator)",
+        "--min-replica-count=$MinReplicas",
+        "--max-replica-count=$MaxReplicas"
+    )
+    if ($MaxReplicas -gt $MinReplicas) {
+        $deployArgs += "--autoscaling-metric-specs=aiplatform.googleapis.com/prediction/online/accelerator/duty_cycle=$DutyCycleTarget"
+    }
+    & gcloud @deployArgs
 } else {
     Write-Host "Deploying on CPU (e2-standard-4)..." -ForegroundColor Yellow
     gcloud ai endpoints deploy-model $ENDPOINT_ID `

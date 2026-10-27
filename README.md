@@ -42,6 +42,33 @@ Without it, a test tile's logits move by 144 on average and the detection moves 
 
 The legacy v5 path (`image_bytes`) is unchanged: KongNet's own 0.99 peak threshold on probabilities.
 
+## Throughput (OncoGemma v7.2 Stage 3 spec §12.1)
+
+- **Batched forward passes.** Every v3 patch of a request goes through the model together, up to
+  `MIDOG_MAX_BATCH` patches per pass (default 16). Inference runs off the event loop, so health probes answer
+  during a long batch. With the real weights on CPU, a patch's logits in a batch of 4 match its single-patch
+  logits to about 2e-7 (`tests/test_batching.py`, with `KONGNET_WEIGHTS` set).
+- **Tile packs.** An instance `{"tile_pack_uri": "gs://bucket/x.npz", "mpp": 0.25, "min_prob": 0.01}` names an
+  npz holding `tiles` (N x 512 x 512 x 3, uint8, N <= `MIDOG_MAX_PACK_TILES`, default 256). Its prediction is
+  `{"tiles": [<one v3 answer per tile, in order>], "error": null}`.
+  - The container reads the pack with its own service account, the Vertex AI custom code service agent, which
+    needs `roles/storage.objectViewer` on the bucket.
+  - The request stays a few hundred bytes whatever N is, so the payload limit no longer caps the batch.
+  - OncoGemma's wire format `kongnet_midog_v3_pack` writes the packs.
+- **fp16.** `MIDOG_PRECISION=fp16` runs the forward pass under CUDA autocast. The engine first recomputes the
+  golden tiles on the serving GPU and refuses to load (503) unless they match the fp32 record within 0.05 logits
+  with the same peaks. The calibration card is fitted on fp32 logits; re-run G1 parity before switching.
+- **Hardware and autoscaling.** For example:
+
+  ```powershell
+  .\deploy.ps1 -Gpu l4 -MinReplicas 1 -MaxReplicas 3 -MaxBatch 32
+  ```
+
+  This serves on g2-standard-4 with an L4, scaling on GPU duty cycle (`-DutyCycleTarget`, default 60%).
+  `-Precision fp16` adds the fp16 path.
+
+Measure each change with OncoGemma's G3-3 throughput run before and after; none of these gains is assumed.
+
 ## v6 Service Contract (v2)
 
 ### Endpoints

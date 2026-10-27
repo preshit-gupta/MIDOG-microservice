@@ -3,12 +3,14 @@ import io
 import math
 import os
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from PIL import Image
 import numpy as np
 
 from engine import NMS_RADIUS_UM, PEAK_MIN_DISTANCE_UM, float32_sigmoid, get_engine, logit_of
+from tile_pack import TilePackError, read_tile_pack
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("midog-detector")
@@ -66,7 +68,54 @@ def metadata() -> Dict[str, Any]:
         "peak_min_distance_um": PEAK_MIN_DISTANCE_UM,
         "nms_radius_um": NMS_RADIUS_UM,
         "preproc": "imagenet_mean_std",
+        "max_batch": getattr(engine, "max_batch", 1),
+        "precision": getattr(engine, "precision", "fp32"),
+        "instances": ["image_png_b64", "tile_pack_uri", "image_bytes"],
     }
+
+
+def _points(raw_points) -> List[Dict[str, Any]]:
+    points = []
+    for x, y, logit in raw_points:
+        if not math.isfinite(float(logit)):
+            raise ValueError(f"non-finite logit {logit} at ({x}, {y})")
+        points.append({
+            "x": round(float(x), 2),
+            "y": round(float(y), 2),
+            "prob": round(float32_sigmoid(logit), 4),
+            "logit": round(float(logit), 4),
+        })
+    return points
+
+
+def _run_batch(engine, imgs: List[np.ndarray], floors: List[float]) -> List[Dict[str, Any]]:
+    """Contract v3 for several patches through one batched engine call; one answer per patch, in order.
+
+    A failed batch is retried patch by patch, so one bad patch costs only its own answer."""
+    try:
+        return [{"points": _points(r), "error": None} for r in engine.predict_logits_batch(imgs, floors)]
+    except Exception as e:  # fall back to single patches so the error lands on the patch that caused it
+        logger.error(f"Batched inference failed ({e}); retrying {len(imgs)} patches one by one")
+    out = []
+    for img, floor in zip(imgs, floors):
+        try:
+            out.append({"points": _points(engine.predict_logits(img, min_logit=floor)), "error": None})
+        except Exception as e:
+            out.append({"points": [], "error": f"inference_error: {e}"})
+    return out
+
+
+def _check_mpp(engine, mpp: Any) -> Optional[str]:
+    if mpp is None:
+        return "missing_mpp: 'mpp' field is required in v2 contract"
+    try:
+        mpp_val = float(mpp)
+    except (ValueError, TypeError):
+        return f"invalid_mpp: expected float, got {mpp}"
+    expected_mpp = float(engine.input_mpp)
+    if abs(mpp_val - expected_mpp) / expected_mpp > 0.01:
+        return f"mpp_mismatch: expected {expected_mpp}, got {mpp_val}"
+    return None
 
 
 @app.post(PREDICT_ROUTE)
@@ -96,6 +145,10 @@ async def predict(request: Request) -> Dict[str, Any]:
         return {"predictions": [], "model_sha256": weights_sha}
 
     predictions: List[Dict[str, Any]] = []
+    # v3 patches waiting for the batched engine call: (prediction index, patch, logit floor).
+    pending: List[Tuple[int, np.ndarray, float]] = []
+    # Tile packs (spec §12.1, "send references, not pixels"): (prediction index, patches, logit floor).
+    packs: List[Tuple[int, List[np.ndarray], float]] = []
 
     for idx, item in enumerate(instances):
         # 1. v2/v3 Contract Format: image_png_b64 + mpp (v3 answers are v2 answers plus logits)
@@ -117,23 +170,9 @@ async def predict(request: Request) -> Dict[str, Any]:
                 continue
 
             # Check MPP resolution
-            mpp = item.get("mpp")
-            if mpp is None:
-                predictions.append({"points": [], "error": "missing_mpp: 'mpp' field is required in v2 contract"})
-                continue
-
-            try:
-                mpp_val = float(mpp)
-            except (ValueError, TypeError):
-                predictions.append({"points": [], "error": f"invalid_mpp: expected float, got {mpp}"})
-                continue
-
-            expected_mpp = float(engine.input_mpp)
-            if abs(mpp_val - expected_mpp) / expected_mpp > 0.01:
-                predictions.append({
-                    "points": [],
-                    "error": f"mpp_mismatch: expected {expected_mpp}, got {mpp_val}",
-                })
+            mpp_error = _check_mpp(engine, item.get("mpp"))
+            if mpp_error:
+                predictions.append({"points": [], "error": mpp_error})
                 continue
 
             # Check image size
@@ -159,22 +198,27 @@ async def predict(request: Request) -> Dict[str, Any]:
             except (TypeError, ValueError) as e:
                 predictions.append({"points": [], "error": f"invalid_min_prob: {e}"})
                 continue
+            predictions.append({"points": [], "error": None})  # filled after the batched call
+            pending.append((idx, img_rgb, min_logit))
+
+        # 1b. Tile pack: a GCS npz of N patches; one prediction with one answer per patch, in pack order.
+        elif "tile_pack_uri" in item:
+            mpp_error = _check_mpp(engine, item.get("mpp"))
+            if mpp_error:
+                predictions.append({"tiles": [], "error": mpp_error})
+                continue
             try:
-                raw_points = engine.predict_logits(img_rgb, min_logit=min_logit)
-                points = []
-                for x, y, logit in raw_points:
-                    if not math.isfinite(float(logit)):
-                        raise ValueError(f"non-finite logit {logit} at ({x}, {y})")
-                    points.append({
-                        "x": round(float(x), 2),
-                        "y": round(float(y), 2),
-                        "prob": round(float32_sigmoid(logit), 4),
-                        "logit": round(float(logit), 4),
-                    })
-                predictions.append({"points": points, "error": None})
-            except Exception as e:
-                logger.error(f"Inference error on v3 instance #{idx}: {e}")
-                predictions.append({"points": [], "error": f"inference_error: {e}"})
+                min_logit = logit_of(float(item.get("min_prob", default_min_prob)))
+            except (TypeError, ValueError) as e:
+                predictions.append({"tiles": [], "error": f"invalid_min_prob: {e}"})
+                continue
+            try:
+                tiles = await run_in_threadpool(read_tile_pack, str(item["tile_pack_uri"]), int(engine.patch_px))
+            except TilePackError as e:
+                predictions.append({"tiles": [], "error": str(e)})
+                continue
+            predictions.append({"tiles": [], "error": None})
+            packs.append((idx, tiles, min_logit))
 
         # 2. Legacy v5 Format: image_bytes
         elif "image_bytes" in item:
@@ -212,8 +256,20 @@ async def predict(request: Request) -> Dict[str, Any]:
         else:
             predictions.append({
                 "points": [],
-                "error": "invalid_instance: expected 'image_png_b64' (v2) or 'image_bytes' (legacy)",
+                "error": "invalid_instance: expected 'image_png_b64' (v2), 'tile_pack_uri' or 'image_bytes' (legacy)",
             })
+
+    # One batched engine call for every v3 patch of the request, pack patches included, off the event loop.
+    patches = [img for _, img, _ in pending] + [t for _, tiles, _ in packs for t in tiles]
+    floors = [f for _, _, f in pending] + [f for _, tiles, f in packs for _ in tiles]
+    if patches:
+        answers = await run_in_threadpool(_run_batch, engine, patches, floors)
+        for k, (idx, _, _) in enumerate(pending):
+            predictions[idx] = answers[k]
+        cursor = len(pending)
+        for idx, tiles, _ in packs:
+            predictions[idx] = {"tiles": answers[cursor:cursor + len(tiles)], "error": None}
+            cursor += len(tiles)
 
     return {
         "predictions": predictions,
