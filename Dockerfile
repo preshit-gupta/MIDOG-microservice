@@ -24,6 +24,13 @@ COPY engine.py ./
 COPY scripts/prewarm_weights.py scripts/
 RUN python scripts/prewarm_weights.py
 
+# Gate G1 (contract v3): the engine's logit path must reproduce the recorded logits of two synthetic
+# tiles with these weights. A build whose logits differ (e.g. without the ImageNet preproc) fails here.
+COPY tests/__init__.py tests/golden_tiles.py tests/
+COPY tests/fixtures/golden_logits.json tests/fixtures/
+COPY scripts/golden_logits.py scripts/
+RUN python scripts/golden_logits.py --check tests/fixtures/golden_logits.json
+
 # Copy application files
 COPY main.py ./
 

@@ -69,17 +69,18 @@ def png_b64(img: Image.Image) -> str:
 
 
 def dedupe(points, radius):
+    """Greedy suppression across patch overlaps by score (point[2]); extra fields ride along."""
     kept = []
-    for x, y, p in sorted(points, key=lambda t: -t[2]):
-        if all(math.hypot(x - kx, y - ky) > radius for kx, ky, _ in kept):
-            kept.append((x, y, p))
+    for point in sorted(points, key=lambda t: -t[2]):
+        if all(math.hypot(point[0] - k[0], point[1] - k[1]) > radius for k in kept):
+            kept.append(point)
     return kept
 
 
 def true_positives(points, truth, radius) -> int:
     used = np.zeros(len(truth), dtype=bool)
     tp = 0
-    for x, y, _ in sorted(points, key=lambda t: -t[2]):
+    for x, y, *_ in sorted(points, key=lambda t: -t[2]):
         if not len(truth):
             break
         d = np.hypot(truth[:, 0] - x, truth[:, 1] - y)
@@ -90,6 +91,41 @@ def true_positives(points, truth, radius) -> int:
     return tp
 
 
+def matched(points, truth, radius) -> np.ndarray:
+    """1 for each point (in the given order) that greedy matching by score assigns to a labelled figure."""
+    order = sorted(range(len(points)), key=lambda i: -points[i][2])
+    used = np.zeros(len(truth), dtype=bool)
+    y = np.zeros(len(points), dtype=int)
+    for i in order:
+        if not len(truth):
+            break
+        d = np.hypot(truth[:, 0] - points[i][0], truth[:, 1] - points[i][1])
+        d[used] = np.inf
+        j = int(np.argmin(d))
+        if d[j] <= radius:
+            used[j], y[i] = True, 1
+    return y
+
+
+def auroc(y: np.ndarray, score: np.ndarray) -> float:
+    """Mann-Whitney AUROC with ties counted half."""
+    pos, neg = score[y == 1], score[y == 0]
+    if not len(pos) or not len(neg):
+        return float("nan")
+    greater = (pos[:, None] > neg[None, :]).sum() + 0.5 * (pos[:, None] == neg[None, :]).sum()
+    return float(greater / (len(pos) * len(neg)))
+
+
+def report_ranking(points, truth, radius) -> None:
+    """Contract v3: how well logit and prob rank the candidates at p >= 0.3 (the Stage 4 floor)."""
+    cands = [p for p in points if p[2] >= math.log(0.3 / 0.7)]
+    y = matched(cands, truth, radius)
+    logit = np.array([p[2] for p in cands])
+    prob = np.array([p[3] for p in cands])
+    print(f"  v3 ranking, {len(cands)} candidates at p >= 0.3 ({int(y.sum())} TP): AUROC logit {auroc(y, logit):.3f}, "
+          f"prob {auroc(y, prob):.3f}; prob == 1.0 for {np.mean(prob >= 1.0):.0%}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--image", type=Path, required=True)
@@ -98,7 +134,8 @@ def main() -> int:
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--region", required=True)
-    parser.add_argument("--contract", choices=("v2", "legacy"), default="v2")
+    parser.add_argument("--contract", choices=("v3", "v2", "legacy"), default="v3",
+                        help="v3 ranks by the logit each point carries; v2 by prob")
     parser.add_argument("--min-f1", type=float, help="exit 1 if the best F1 is lower")
     args = parser.parse_args()
 
@@ -109,7 +146,7 @@ def main() -> int:
     image = Image.open(args.image).convert("RGB")
     endpoint = aiplatform.Endpoint(args.endpoint, project=args.project, location=args.region)
     service_mpp = 0.25  # the v2 contract's input_mpp (1% tolerance)
-    if args.contract == "v2" and abs(mpp - service_mpp) / service_mpp > 0.01:
+    if args.contract in ("v2", "v3") and abs(mpp - service_mpp) / service_mpp > 0.01:
         # Resample to the contract's resolution, as the pipeline does (SPEC-06 §5.1), and
         # move the labels with it. The legacy contract is sent at the native resolution.
         factor = mpp / service_mpp
@@ -121,7 +158,7 @@ def main() -> int:
     def detect(origin):
         x, y = origin
         patch = image.crop((x, y, x + PATCH_PX, y + PATCH_PX))
-        if args.contract == "v2":
+        if args.contract in ("v2", "v3"):
             instance, parameters = {"image_png_b64": png_b64(patch), "mpp": service_mpp}, {"min_prob": 0.01}
         else:
             instance, parameters = {"image_bytes": png_b64(patch), "confidence_threshold": 0.0}, None
@@ -129,7 +166,11 @@ def main() -> int:
         prediction = answer.predictions[0]
         if prediction.get("error"):
             raise SystemExit(f"patch {origin}: {prediction['error']}")
-        if args.contract == "v2":
+        if args.contract == "v3":
+            if any("logit" not in q for q in prediction["points"]):
+                raise SystemExit(f"patch {origin}: points without a logit; the endpoint serves v2, not v3")
+            found = [(x + q["x"], y + q["y"], q["logit"], q["prob"]) for q in prediction["points"]]
+        elif args.contract == "v2":
             found = [(x + q["x"], y + q["y"], q["prob"]) for q in prediction["points"]]
         else:
             found = [(x + b["cx"], y + b["cy"], b["confidence"]) for b in prediction["boxes"]]
@@ -142,9 +183,12 @@ def main() -> int:
     print(f"{args.image.name}: {mpp:.4f} um/px, {len(mf)} mitotic figures, {len(imposters)} imposters; "
           f"{len(origins)} {args.contract} requests to deployed model(s) {sorted({m for _, m in results})}")
 
+    if args.contract == "v3":
+        report_ranking(points, mf, radius_px)
     best = 0.0
     for t in THRESHOLDS:
-        sel = [p for p in points if p[2] >= t]
+        floor = math.log(t / (1 - t)) if args.contract == "v3" else t  # v3 scores are logits
+        sel = [p for p in points if p[2] >= floor]
         tp = true_positives(sel, mf, radius_px)
         fp = len(sel) - tp
         misses = [p for p in sel if true_positives([p], mf, radius_px) == 0]

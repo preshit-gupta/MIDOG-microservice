@@ -4,6 +4,44 @@ This repository contains the production-grade deployment package for serving the
 
 ---
 
+## Contract v3: logits (OncoGemma v7.2)
+
+v3 keeps the v2 request and response and adds one field: every point also carries its **`logit`**.
+`/metadata` reports `"contract": "v3"`, `"point_fields": ["x", "y", "prob", "logit"]`,
+`"peak_rule": "logit_peaks"`, `"peak_min_distance_um": 5.0`, `"nms_radius_um": 7.5` and
+`"preproc": "imagenet_mean_std"`. A v2 client keeps working: it ignores the new field.
+
+```json
+{"predictions": [{"points": [{"x": 256.0, "y": 255.5, "prob": 1.0, "logit": 118.42}], "error": null}],
+ "model_sha256": "978afb33..."}
+```
+
+**Why.** The model's probability map is a float32 sigmoid, which reads exactly 1.0 wherever the logit
+passes about 17. On MIDOG++ breast, 80% of in-tissue candidates score 1.0, so peaks found on the
+probability map sit anywhere inside the plateau and their probabilities cannot rank them. v3 finds
+peaks on the **logit** map instead:
+- local maxima at least 5 µm apart, at or above `logit(min_prob)` (inclusive);
+- greedy suppression within 7.5 µm, strongest logit first (equal logits by row, then column);
+- `prob` is the float32 sigmoid of the logit, as v2 returned it.
+
+On 6 MIDOG++ breast images, logit peaks return the same 456 candidates as probability peaks, and
+the logit ranks them better: AUROC 0.846 against 0.772.
+
+**Normalisation.** TIAToolbox's `infer_batch` does not normalise; its engines call the model's
+`preproc` (ImageNet mean and std) per patch. `KongNetEngine.logit_map` calls it explicitly.
+Without it, a test tile's logits move by 144 on average and the detection moves off the figure.
+
+**Checks (gate G1):**
+- `pytest tests`: contract and engine tests, offline (no TIAToolbox, no GPU).
+- `KONGNET_WEIGHTS=/path/KongNet_Det_MIDOG_1.pth pytest tests/test_golden_logits.py` reproduces the
+  recorded logits of two deterministic synthetic tiles (`tests/golden_tiles.py`,
+  `tests/fixtures/golden_logits.json`, from `scripts/golden_logits.py`). Run it in the built image
+  with `KONGNET_WEIGHTS=/root/.tiatoolbox/models/KongNet_Det_MIDOG_1.pth`.
+- `scripts/positive_control.py --contract v3 ...` on a labelled MIDOG++ image reports F1 by
+  threshold and the AUROC of logit and prob among candidates at p >= 0.3.
+
+The legacy v5 path (`image_bytes`) is unchanged: KongNet's own 0.99 peak threshold on probabilities.
+
 ## v6 Service Contract (v2)
 
 ### Endpoints
