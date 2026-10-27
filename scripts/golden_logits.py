@@ -22,6 +22,7 @@ from engine import MODEL_INPUT_MPP, MODEL_NAME, KongNetEngine, compute_file_sha2
 from tests.golden_tiles import PROBES, TILES  # noqa: E402
 
 MIN_PROB = 0.01
+FIXTURE = ROOT / "tests" / "fixtures" / "golden_logits.json"
 ATOL = 0.05  # logits: CPU vs GPU and BLAS differences are far smaller; a missing preproc moves them by ~144
 
 

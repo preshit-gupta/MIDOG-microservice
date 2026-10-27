@@ -24,6 +24,12 @@ and its logit ranks them better (AUROC 0.846 against 0.772).
 
 TIAToolbox's ``infer_batch`` does not normalise its input; its engines call the model's
 ``preproc`` (ImageNet mean and std) per patch first. ``logit_map`` does the same, explicitly.
+
+Throughput (OncoGemma v7.2 Stage 3 spec §12.1): ``logit_maps`` runs up to ``MIDOG_MAX_BATCH`` patches
+(default 16) in one forward pass; each patch's logits match its single-patch pass within the golden tolerance.
+``MIDOG_PRECISION=fp16`` runs the forward pass under CUDA autocast. The calibration card is fitted on
+fp32 logits, so an fp16 engine first checks the golden tiles (``scripts/golden_logits.py``) and refuses to load
+when they differ beyond the tolerance; the service then answers 503.
 """
 import hashlib
 import logging
@@ -47,6 +53,10 @@ MODEL_INPUT_MPP = 0.25
 # Contract v3 peak rule (see the module docstring).
 PEAK_MIN_DISTANCE_UM = 5.0
 NMS_RADIUS_UM = 7.5
+# Throughput (spec §12.1): patches per forward pass, and the forward pass's precision.
+MAX_BATCH = int(os.environ.get("MIDOG_MAX_BATCH", "16"))
+PRECISION = os.environ.get("MIDOG_PRECISION", "fp32")
+PRECISIONS = ("fp32", "fp16")
 
 Point = Tuple[float, float, float]
 LogitPoint = Tuple[float, float, float]  # (x, y, logit) in input-image pixels
@@ -222,13 +232,36 @@ class KongNetEngine:
         self.model.eval()
         self.model.to(self.device)
         self.target_channels = list(getattr(self.model, "target_channels", None) or [0])
-        # One patch at a time through the detector: fixed batch size, deterministic order.
+        # One forward pass at a time; a pass holds up to max_batch patches, in request order.
         self._lock = threading.Lock()
+        self.max_batch = MAX_BATCH
+        self.precision = PRECISION
+        if self.precision not in PRECISIONS:
+            raise EngineError(f"MIDOG_PRECISION must be one of {PRECISIONS}, got {self.precision!r}")
+        if self.precision == "fp16":
+            if self.device != "cuda":
+                raise EngineError("MIDOG_PRECISION=fp16 needs a GPU")
+            self.check_golden()
         logger.info(
             f"KongNetEngine ready: tiatoolbox {self.tiatoolbox_version}, input {self.input_mpp} um/px "
             f"(IO config says {self.ioconfig_input_mpp}), "
-            f"{self.patch_px} px patches, weights sha256 {self.weights_sha256}"
+            f"{self.patch_px} px patches, weights sha256 {self.weights_sha256}, "
+            f"{self.precision}, up to {self.max_batch} patches per forward pass"
         )
+
+    def check_golden(self) -> None:
+        """Refuse to serve when the golden tiles' logits differ from the fp32 record (fp16, or a new GPU)."""
+        import json
+
+        from scripts.golden_logits import FIXTURE, differences, record
+
+        want = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        if want["weights_sha256"] != self.weights_sha256:
+            raise EngineError("the golden fixture was recorded with other weights")
+        problems = differences(record(self), want["tiles"])
+        if problems:
+            raise EngineError(f"{self.precision} logits differ from the fp32 golden record: " + "; ".join(problems))
+        logger.info(f"{self.precision} logits match the fp32 golden record")
 
     def predict(self, img_rgb: np.ndarray, threshold_abs: Optional[float] = None) -> List[Point]:
         """
@@ -264,21 +297,39 @@ class KongNetEngine:
         ``preproc`` (ImageNet normalisation) first, as TIAToolbox's engines do per patch, then
         the forward pass without the sigmoid ``infer_batch`` applies.
         """
+        return self.logit_maps([img_rgb])[0]
+
+    def logit_maps(self, imgs: List[np.ndarray]) -> List[np.ndarray]:
+        """``logit_map`` of each patch, up to ``max_batch`` patches per forward pass, in order."""
         import torch
 
-        if img_rgb.ndim != 3 or img_rgb.shape[2] != 3:
-            raise EngineError(f"expected an H x W x 3 RGB patch, got shape {img_rgb.shape}")
-        batch = np.ascontiguousarray(self.model.preproc(np.asarray(img_rgb)[None]), dtype=np.float32)
-        with self._lock, torch.inference_mode():
-            x = torch.from_numpy(batch).permute(0, 3, 1, 2).to(self.device)
-            out = self.model(x)
-            out = out[0] if isinstance(out, (list, tuple)) else out
-            logits = out[:, self.target_channels].permute(0, 2, 3, 1).float().cpu().numpy()
-        return logits[0, :, :, 0]
+        for img in imgs:
+            if img.ndim != 3 or img.shape[2] != 3:
+                raise EngineError(f"expected an H x W x 3 RGB patch, got shape {img.shape}")
+        maps: List[np.ndarray] = []
+        step = max(1, int(getattr(self, "max_batch", 1)))
+        fp16 = getattr(self, "precision", "fp32") == "fp16"
+        for start in range(0, len(imgs), step):
+            chunk = np.stack([np.asarray(i) for i in imgs[start:start + step]])
+            batch = np.ascontiguousarray(self.model.preproc(chunk), dtype=np.float32)
+            with self._lock, torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16, enabled=fp16):
+                x = torch.from_numpy(batch).permute(0, 3, 1, 2).to(self.device)
+                out = self.model(x)
+                out = out[0] if isinstance(out, (list, tuple)) else out
+                logits = out[:, self.target_channels].permute(0, 2, 3, 1).float().cpu().numpy()
+            maps.extend(logits[k, :, :, 0] for k in range(logits.shape[0]))
+        return maps
 
     def predict_logits(self, img_rgb: np.ndarray, min_logit: float) -> List[LogitPoint]:
         """Contract v3: (x, y, logit) detections of one patch at or above ``min_logit``."""
-        return peaks_from_logit_map(self.logit_map(img_rgb), self.input_mpp, min_logit)
+        return self.predict_logits_batch([img_rgb], [min_logit])[0]
+
+    def predict_logits_batch(self, imgs: List[np.ndarray], min_logits: List[float]) -> List[List[LogitPoint]]:
+        """``predict_logits`` for several patches, batched through the forward pass."""
+        if len(imgs) != len(min_logits):
+            raise EngineError("one logit floor per patch")
+        return [peaks_from_logit_map(m, self.input_mpp, floor)
+                for m, floor in zip(self.logit_maps(imgs), min_logits)]
 
 
 class FakeEngine:
@@ -310,10 +361,16 @@ class FakeEngine:
         self.thresholds: List[Optional[float]] = []
         # The logit floor of every predict_logits call (contract v3).
         self.logit_floors: List[float] = []
+        # The size of every predict_logits_batch call.
+        self.batches: List[int] = []
 
     def predict(self, img_rgb: np.ndarray, threshold_abs: Optional[float] = None) -> List[Point]:
         self.thresholds.append(threshold_abs)
         return self.mock_predictions
+
+    def predict_logits_batch(self, imgs: List[np.ndarray], min_logits: List[float]) -> List[List[LogitPoint]]:
+        self.batches.append(len(imgs))
+        return [self.predict_logits(img, floor) for img, floor in zip(imgs, min_logits)]
 
     def predict_logits(self, img_rgb: np.ndarray, min_logit: float) -> List[LogitPoint]:
         """The mock predictions as logits, floored like the real engine (no peak finding)."""
