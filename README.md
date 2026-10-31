@@ -51,8 +51,9 @@ The legacy v5 path (`image_bytes`) is unchanged: KongNet's own 0.99 peak thresho
 - **Tile packs.** An instance `{"tile_pack_uri": "gs://bucket/x.npz", "mpp": 0.25, "min_prob": 0.01}` names an
   npz holding `tiles` (N x 512 x 512 x 3, uint8, N <= `MIDOG_MAX_PACK_TILES`, default 256). Its prediction is
   `{"tiles": [<one v3 answer per tile, in order>], "error": null}`.
-  - The container reads the pack with its own service account, the Vertex AI custom code service agent, which
-    needs `roles/storage.objectViewer` on the bucket.
+  - The container reads the pack as the service account it is deployed with (`deploy.ps1 -ServiceAccount`, default
+    `midog-endpoint-sa@<project>`), which needs `roles/storage.objectViewer` on the bucket. Deployed without one,
+    the model runs as a Google-managed identity that bucket IAM cannot reach, and packs answer 403.
   - The request stays a few hundred bytes whatever N is, so the payload limit no longer caps the batch.
   - OncoGemma's wire format `kongnet_midog_v3_pack` writes the packs.
 - **fp16.** `MIDOG_PRECISION=fp16` runs the forward pass under CUDA autocast. The engine first recomputes the
