@@ -43,7 +43,11 @@ param(
     [ValidateRange(1, 64)]
     [int]$MaxBatch = 16,
     [ValidateSet("fp32", "fp16")]
-    [string]$Precision = "fp32"
+    [string]$Precision = "fp32",
+    # The container's runtime identity: it reads tile packs from GCS (tile_pack_uri). OncoGemma's Terraform creates
+    # it and grants it read on the tile-pack buckets (infra/terraform/iam.tf, storage.tf). Without it the model runs
+    # as a Google-managed identity that bucket IAM cannot reach, and every tile pack answers pack_read_error 403.
+    [string]$ServiceAccount = "midog-endpoint-sa@$ProjectId.iam.gserviceaccount.com"
 )
 
 # Default to GPU if neither or both specified
@@ -187,7 +191,8 @@ if ($useGpu) {
         "--machine-type=$($gpuSpec.Machine)",
         "--accelerator=$($gpuSpec.Accelerator)",
         "--min-replica-count=$MinReplicas",
-        "--max-replica-count=$MaxReplicas"
+        "--max-replica-count=$MaxReplicas",
+        "--service-account=$ServiceAccount"
     )
     if ($MaxReplicas -gt $MinReplicas) {
         $deployArgs += "--autoscaling-metric-specs=aiplatform.googleapis.com/prediction/online/accelerator/duty_cycle=$DutyCycleTarget"
@@ -201,7 +206,8 @@ if ($useGpu) {
         --display-name="${ModelDisplayName}-cpu-deploy" `
         --machine-type="e2-standard-4" `
         --min-replica-count=1 `
-        --max-replica-count=1
+        --max-replica-count=1 `
+        --service-account=$ServiceAccount
 }
 
 if ($LASTEXITCODE -eq 0) {
